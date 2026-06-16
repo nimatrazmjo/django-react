@@ -118,6 +118,119 @@ kubectl get hpa -n production
 
 ---
 
+## Running locally with Docker Desktop Kubernetes
+
+Use the QA overlay — it runs 1 replica per service and uses the smallest resource footprint.
+
+**1. Enable Kubernetes in Docker Desktop**
+
+Settings → Kubernetes → Enable Kubernetes → Apply & Restart. Takes 1–2 minutes.
+
+```bash
+kubectl config use-context docker-desktop
+kubectl get nodes   # should show 1 node, STATUS Ready
+```
+
+**2. Install the nginx ingress controller**
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.11.2/deploy/static/provider/cloud/deploy.yaml
+
+# Wait for it to be ready before continuing
+kubectl wait --namespace ingress-nginx \
+  --for=condition=ready pod \
+  --selector=app.kubernetes.io/component=controller \
+  --timeout=90s
+```
+
+**3. Run a local image registry**
+
+The manifests use `imagePullPolicy: Always`, which means Kubernetes pulls from a registry on every pod start — it won't use images sitting in your local Docker daemon directly. A local registry running in Docker solves this without changing any files.
+
+```bash
+docker run -d -p 5000:5000 --name local-registry registry:2
+```
+
+**4. Build and push images to the local registry**
+
+Run these from the repo root. The frontend build must use `.` (repo root) as the build context because `frontend/Dockerfile` copies `nginx/nginx.conf` from the repo root — passing `./frontend` as context causes a "not found" error.
+
+```bash
+# Backend
+docker build \
+  --target production \
+  -t localhost:5000/backend:latest \
+  ./backend
+
+# Frontend — note: context is . (repo root), not ./frontend
+docker build \
+  --target production \
+  -f frontend/Dockerfile \
+  --build-arg VITE_API_URL=http://localhost \
+  --build-arg VITE_ENV=development \
+  -t localhost:5000/frontend:latest \
+  .
+
+docker push localhost:5000/backend:latest
+docker push localhost:5000/frontend:latest
+```
+
+**5. Apply the QA overlay**
+
+```bash
+kubectl apply -k k8s/overlays/qa
+```
+
+Pods will show `ImagePullBackOff` immediately — that's expected. The next two steps fix that.
+
+**6. Create secrets with local dev values**
+
+```bash
+kubectl create secret generic app-secrets \
+  --from-literal=DJANGO_SECRET_KEY=local-dev-secret-key \
+  --from-literal=DATABASE_URL=postgres://postgres:postgres@db:5432/myapp_dev \
+  --from-literal=REDIS_URL=redis://redis:6379/0 \
+  --from-literal=POSTGRES_USER=postgres \
+  --from-literal=POSTGRES_PASSWORD=postgres \
+  --from-literal=POSTGRES_DB=myapp_dev \
+  -n qa --dry-run=client -o yaml | kubectl apply -f -
+```
+
+**7. Point deployments at the local registry**
+
+```bash
+kubectl set image deployment/backend  backend=localhost:5000/backend:latest   -n qa
+kubectl set image deployment/frontend frontend=localhost:5000/frontend:latest  -n qa
+```
+
+**8. Route traffic via /etc/hosts**
+
+The ingress is configured for `myapp.com`. Add this line to `/etc/hosts` so your browser resolves it to localhost:
+
+```
+127.0.0.1 myapp.com
+```
+
+Then open `http://myapp.com`.
+
+**9. Verify everything is running**
+
+```bash
+kubectl get pods -n qa          # all should reach Running status
+kubectl logs -l app=backend -n qa --tail=50
+```
+
+The first time the DB pod starts it takes 20–30 seconds to initialise. The backend will crash-loop briefly until postgres is ready — that's normal, it will stabilise on its own.
+
+**Tear down**
+
+```bash
+kubectl delete namespace qa
+docker stop local-registry && docker rm local-registry
+```
+
+---
+
 ## Prerequisites
 
 Before applying anything, ensure the following are installed and configured in your AKS cluster:

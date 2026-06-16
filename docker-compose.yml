@@ -23,7 +23,8 @@ services:
 
   frontend:
     build:
-      context: ./frontend
+      context: .
+      dockerfile: frontend/Dockerfile
       target: development          # Vite dev server with HMR
     volumes:
       - ./frontend:/app            # bind mount for hot reload

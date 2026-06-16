@@ -13,7 +13,8 @@ services:
 
   frontend:
     build:
-      context: ./frontend
+      context: .
+      dockerfile: frontend/Dockerfile
       target: staging
       args:
         VITE_API_URL: https://staging.myapp.com

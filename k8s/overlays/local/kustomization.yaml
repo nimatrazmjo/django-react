@@ -1,0 +1,272 @@
+# overlays/local/kustomization.yaml — Local development overlay for K8s testing.
+#
+# Purpose:
+#   Lets you test the full Kubernetes stack on a local cluster (minikube / kind / k3d)
+#   using images built and pushed to a local registry at localhost:5000.
+#
+# Prerequisites:
+#   1. A local K8s cluster with a registry reachable at localhost:5000.
+#      Quickstart options:
+#        minikube:  minikube start && minikube addons enable registry
+#        k3d:       k3d cluster create local --registry-create local-registry:localhost:5000
+#        kind:      kind create cluster  (use `kind load docker-image` instead of a registry)
+#
+#   2. Build and push images to localhost:5000:
+#        docker build --target production -f frontend/Dockerfile \
+#          --build-arg VITE_API_URL=http://localhost \
+#          --build-arg VITE_ENV=development \
+#          -t localhost:5000/frontend:latest .
+#        docker push localhost:5000/frontend:latest
+#
+#        docker build --target production -f backend/Dockerfile \
+#          -t localhost:5000/backend:latest .
+#        docker push localhost:5000/backend:latest
+#
+# Deploy:
+#   kubectl apply -k k8s/overlays/local
+#
+# Preview manifests without applying:
+#   kubectl kustomize k8s/overlays/local
+#
+# Access after deploy (no Ingress controller needed locally):
+#   kubectl port-forward svc/frontend 8080:80 -n local
+#   kubectl port-forward svc/backend  8000:8000 -n local
+#
+# Tear down:
+#   kubectl delete -k k8s/overlays/local
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ── Namespace ──────────────────────────────────────────────────────────────────
+namespace: local
+
+# ── Base layer ─────────────────────────────────────────────────────────────────
+resources:
+  - ../../base
+
+# ── Image overrides ────────────────────────────────────────────────────────────
+# Replaces the ACR image refs in every Deployment with localhost:5000 equivalents.
+# Kustomize matches on the image name field exactly as it appears in the base
+# deployment manifests — including the <ACR_NAME>.azurecr.io prefix.
+images:
+  - name: <ACR_NAME>.azurecr.io/frontend
+    newName: localhost:5000/frontend
+    newTag: latest
+  - name: <ACR_NAME>.azurecr.io/backend
+    newName: localhost:5000/backend
+    newTag: latest
+
+# ── Patches ────────────────────────────────────────────────────────────────────
+patches:
+
+  # ── Rename the Namespace resource ─────────────────────────────────────────────
+  - target:
+      kind: Namespace
+      name: production
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: local
+
+  # ── ConfigMap — local settings ─────────────────────────────────────────────────
+  - target:
+      kind: ConfigMap
+      name: app-config
+    patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: app-config
+      data:
+        DJANGO_SETTINGS_MODULE: "config.settings.dev"
+        DEBUG: "True"
+        ALLOWED_HOSTS: "localhost,127.0.0.1,backend"
+        CORS_ALLOWED_ORIGINS: "http://localhost:8080,http://localhost"
+        VITE_ENV: "development"
+
+  # ── Secret — local dev values (not real secrets; safe to commit) ───────────────
+  # All values are base64-encoded plain-text dev credentials.
+  # Decode any value with: echo "<value>" | base64 -d
+  #   local-dev-secret-key      → DJANGO_SECRET_KEY
+  #   postgres://postgres:postgres@db:5432/myapp_local → DATABASE_URL
+  #   redis://redis:6379/0      → REDIS_URL
+  #   postgres                  → POSTGRES_USER / POSTGRES_PASSWORD
+  #   myapp_local               → POSTGRES_DB
+  - target:
+      kind: Secret
+      name: app-secrets
+    patch: |-
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: app-secrets
+      data:
+        DJANGO_SECRET_KEY: bG9jYWwtZGV2LXNlY3JldC1rZXk=
+        DATABASE_URL: cG9zdGdyZXM6Ly9wb3N0Z3Jlczpwb3N0Z3Jlc0BkYjo1NDMyL215YXBwX2xvY2Fs
+        REDIS_URL: cmVkaXM6Ly9yZWRpczo2Mzc5LzA=
+        POSTGRES_USER: cG9zdGdyZXM=
+        POSTGRES_PASSWORD: cG9zdGdyZXM=
+        POSTGRES_DB: bXlhcHBfbG9jYWw=
+
+  # ── Ingress — strip hostname so it responds to localhost ───────────────────────
+  # Removing the host field makes nginx-ingress accept requests for any hostname,
+  # including localhost and 127.0.0.1 — no DNS required.
+  # Only applies if you have an ingress controller installed locally.
+  # If not, use kubectl port-forward instead (see header above).
+  - target:
+      kind: Ingress
+      name: app-ingress
+    patch: |-
+      - op: remove
+        path: /spec/rules/0/host
+
+  # ── Backend Deployment ─────────────────────────────────────────────────────────
+  - target:
+      kind: Deployment
+      name: backend
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: backend
+      spec:
+        replicas: 1
+        template:
+          spec:
+            containers:
+              - name: backend
+                imagePullPolicy: IfNotPresent
+                resources:
+                  requests:
+                    cpu: "100m"
+                    memory: "128Mi"
+                  limits:
+                    cpu: "200m"
+                    memory: "256Mi"
+
+  # imagePullSecrets must be removed via JSON 6902 — strategic merge cannot drop a list.
+  - target:
+      kind: Deployment
+      name: backend
+    patch: |-
+      - op: remove
+        path: /spec/template/spec/imagePullSecrets
+
+  # ── Frontend Deployment ────────────────────────────────────────────────────────
+  - target:
+      kind: Deployment
+      name: frontend
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: frontend
+      spec:
+        replicas: 1
+        template:
+          spec:
+            containers:
+              - name: frontend
+                imagePullPolicy: IfNotPresent
+                resources:
+                  requests:
+                    cpu: "50m"
+                    memory: "64Mi"
+                  limits:
+                    cpu: "100m"
+                    memory: "128Mi"
+
+  - target:
+      kind: Deployment
+      name: frontend
+    patch: |-
+      - op: remove
+        path: /spec/template/spec/imagePullSecrets
+
+  # ── PVC — swap AKS storage class for local hostpath ───────────────────────────
+  - target:
+      kind: PersistentVolumeClaim
+      name: postgres-data
+    patch: |-
+      - op: replace
+        path: /spec/storageClassName
+        value: hostpath
+      - op: replace
+        path: /spec/resources/requests/storage
+        value: 1Gi
+
+  # ── DB Deployment ──────────────────────────────────────────────────────────────
+  - target:
+      kind: Deployment
+      name: db
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: db
+      spec:
+        template:
+          spec:
+            containers:
+              - name: postgres
+                resources:
+                  requests:
+                    cpu: "100m"
+                    memory: "128Mi"
+                  limits:
+                    cpu: "200m"
+                    memory: "256Mi"
+
+  # ── Redis Deployment ───────────────────────────────────────────────────────────
+  - target:
+      kind: Deployment
+      name: redis
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: redis
+      spec:
+        template:
+          spec:
+            containers:
+              - name: redis
+                args:
+                  - "--maxmemory"
+                  - "100mb"
+                  - "--maxmemory-policy"
+                  - "allkeys-lru"
+                  - "--save"
+                  - ""
+                resources:
+                  requests:
+                    cpu: "50m"
+                    memory: "64Mi"
+                  limits:
+                    cpu: "100m"
+                    memory: "128Mi"
+
+  # ── Backend HPA — locked to 1 replica (no metrics-server needed locally) ───────
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: backend-hpa
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 1
+      - op: replace
+        path: /spec/maxReplicas
+        value: 1
+
+  # ── Frontend HPA — same lock ───────────────────────────────────────────────────
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: frontend-hpa
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 1
+      - op: replace
+        path: /spec/maxReplicas
+        value: 1
