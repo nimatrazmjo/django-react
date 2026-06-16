@@ -1,248 +1,369 @@
-# .github/workflows/deploy.yaml — CI/CD pipeline: build → push to ACR → deploy to AKS.
+# .github/workflows/deploy.yaml — CI/CD pipeline for all three environments.
 #
-# What this file does:
-#   Runs automatically on every push to the main branch.
-#   Builds all custom Docker images, pushes them to Azure Container Registry,
-#   and deploys the updated manifests to AKS.
+# Branch → environment mapping:
+#   main    → production  (namespace: production, image tags: <sha> + latest)
+#   staging → staging     (namespace: staging,    image tags: staging-<sha> + staging-latest)
+#   qa      → qa          (namespace: qa,          image tags: qa-<sha> + qa-latest)
+#
+# Why branch-prefixed image tags?
+#   ACR is a shared registry. If QA and staging deploy at the same time and both
+#   push "backend:latest", one overwrites the other. Prefixed tags keep each
+#   environment's images completely separate and independently rollback-able.
+#   The full SHA tag is always unique per commit regardless of branch prefix.
 #
 # Required GitHub secrets (Settings → Secrets and variables → Actions):
-#   AZURE_CLIENT_ID        — The client ID of the Azure AD app / managed identity
-#                            configured for OIDC. Not a password — safe to rotate never.
-#   AZURE_TENANT_ID        — Your Azure AD tenant ID (Directory ID).
-#   AZURE_SUBSCRIPTION_ID  — The Azure subscription that contains ACR and AKS.
-#   ACR_NAME               — Your Azure Container Registry name (without .azurecr.io).
-#                            Example: if registry is myapp.azurecr.io, set this to "myapp".
-#   AKS_CLUSTER_NAME       — The name of your AKS cluster in Azure.
-#   AKS_RESOURCE_GROUP     — The resource group that contains your AKS cluster.
+#   AZURE_CLIENT_ID        — Azure AD app client ID for OIDC auth (not a password).
+#   AZURE_TENANT_ID        — Your Azure AD tenant (directory) ID.
+#   AZURE_SUBSCRIPTION_ID  — The Azure subscription containing ACR and AKS.
+#   ACR_NAME               — ACR name without the domain (e.g. "myapp" for myapp.azurecr.io).
+#   AKS_CLUSTER_NAME       — AKS cluster name.
+#   AKS_RESOURCE_GROUP     — Resource group containing the AKS cluster.
 #
-# How to verify the pipeline ran:
-#   Go to GitHub → Actions → deploy.yaml → latest run
-#   Check each step for green checkmarks.
-#   After deploy, run: kubectl rollout status deployment/backend -n production
+# Why OIDC instead of client secrets?
+#   OIDC issues a short-lived token per workflow run scoped to this repo and branch.
+#   No credential is stored anywhere — nothing to rotate, nothing to leak.
+#   If a bad actor gets access to your repo secrets, they get an ID, not a password.
+#   Setup guide: https://learn.microsoft.com/en-us/azure/developer/github/connect-from-azure
 
 name: Build and Deploy to AKS
 
-# ── Trigger ───────────────────────────────────────────────────────────────────
+# ── Triggers ──────────────────────────────────────────────────────────────────
 on:
   push:
     branches:
-      - main  # Only deploy from the main branch.
-              # Push to any other branch does NOT trigger a deploy.
-              # To add staging deploys, add a "staging" branch here with
-              # a separate job that targets a staging AKS namespace.
+      - main     # → production deploy
+      - staging  # → staging deploy
+      - qa       # → qa deploy
+    # All other branches (feature/*, fix/*, etc.) do NOT trigger any deploy.
+    # Open a PR against qa to start the promotion chain: qa → staging → main.
 
-# ── Permissions for OIDC authentication ──────────────────────────────────────
-# Why OIDC instead of client secrets?
-#   Traditional Azure service principal auth requires storing a client secret
-#   in GitHub Secrets and rotating it periodically. If the secret leaks, an
-#   attacker has persistent access until it's rotated.
-#
-#   OIDC (OpenID Connect) works differently:
-#   - GitHub generates a short-lived JWT token for each workflow run.
-#   - Azure trusts GitHub's identity provider and issues a scoped access token.
-#   - The token expires when the workflow run ends (~60 minutes).
-#   - No long-lived credentials are stored anywhere — nothing to rotate, nothing to leak.
-#
-#   Setup: https://learn.microsoft.com/en-us/azure/developer/github/connect-from-azure
+# ── OIDC permissions ──────────────────────────────────────────────────────────
 permissions:
-  id-token: write   # Required: allows this workflow to request an OIDC token from GitHub.
-                    # Without this, the az login --federated-token step will fail.
-  contents: read    # Required: allows the workflow to check out the repository.
+  id-token: write  # Lets this workflow request a GitHub OIDC token to exchange
+                   # for a short-lived Azure access token. Required by azure/login.
+  contents: read   # Lets the workflow check out the repository.
 
+# ── Shared environment variables ──────────────────────────────────────────────
 env:
-  # ── Shared variables ─────────────────────────────────────────────────────────
-  # These are resolved once and reused across all jobs.
   ACR_LOGIN_SERVER: ${{ secrets.ACR_NAME }}.azurecr.io
-  # Full ACR hostname. Azure Container Registry hostnames are always <name>.azurecr.io.
+  # Computed once here; referenced as ${{ env.ACR_LOGIN_SERVER }} in all jobs.
 
 jobs:
   # ═══════════════════════════════════════════════════════════════════════════
-  # JOB 1: Build Docker images and push to ACR
+  # JOB 1: Build and push Docker images to ACR
+  #
+  # Runs on every push to main, staging, or qa.
+  # Produces two outputs consumed by the deploy jobs:
+  #   - image-tag: the short git SHA (e.g. "a1b2c3d")
+  #   - tag-prefix: branch-scoped prefix (e.g. "qa-", "staging-", "")
   # ═══════════════════════════════════════════════════════════════════════════
   build-and-push:
     name: Build and Push Images
     runs-on: ubuntu-latest
-    # outputs allow subsequent jobs to use the git SHA tag without re-computing it
     outputs:
       image-tag: ${{ steps.meta.outputs.tag }}
+      tag-prefix: ${{ steps.meta.outputs.prefix }}
 
     steps:
-      # ── Checkout source code ────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
-        # Checks out the commit that triggered this workflow.
-        # The git SHA used for image tagging comes from github.sha (see below).
 
-      # ── Compute image tags ──────────────────────────────────────────────────
-      - name: Set image tag
+      # ── Compute branch-scoped image tag ──────────────────────────────────────
+      - name: Compute image tags
         id: meta
         run: |
           SHA="${{ github.sha }}"
           SHORT_SHA="${SHA:0:7}"
-          echo "tag=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-        # Why tag with the git SHA?
-        #   The git SHA uniquely identifies the exact commit running in production.
-        #   If a bad deploy goes out, you can roll back by changing the image tag
-        #   in the deployment to a previous SHA — no rebuild needed.
-        #   :latest alone makes it impossible to know which code is deployed or
-        #   to roll back without rebuilding.
-        # We use the short SHA (first 7 chars) for readability in kubectl output.
+          BRANCH="${{ github.ref_name }}"
 
-      # ── Authenticate to Azure via OIDC ─────────────────────────────────────
+          # Prefix image tags by branch so QA/staging/production images never
+          # collide in ACR. Production (main) has no prefix to match convention.
+          if [[ "$BRANCH" == "main" ]]; then
+            PREFIX=""
+          else
+            PREFIX="${BRANCH}-"   # "qa-" or "staging-"
+          fi
+
+          echo "tag=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "prefix=${PREFIX}" >> "$GITHUB_OUTPUT"
+        # Examples of what this produces:
+        #   main    branch, commit abc1234 → tag=abc1234, prefix=""
+        #           images pushed as: backend:abc1234  and backend:latest
+        #   staging branch, commit def5678 → tag=def5678, prefix="staging-"
+        #           images pushed as: backend:staging-def5678 and backend:staging-latest
+        #   qa      branch, commit ghi9012 → tag=ghi9012, prefix="qa-"
+        #           images pushed as: backend:qa-ghi9012 and backend:qa-latest
+
+      # ── Authenticate to Azure via OIDC ───────────────────────────────────────
       - name: Azure login (OIDC)
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-        # This step exchanges the GitHub OIDC token for a short-lived Azure access token.
-        # No password or client secret is used. The token expires when this workflow ends.
-        # Prerequisite: configure a federated credential in your Azure AD app registration
-        # that trusts the GitHub OIDC provider for this repository and branch.
+        # Exchanges the GitHub OIDC JWT for a short-lived Azure access token.
+        # The token is scoped to this repo + branch and expires when the job ends.
+        # No password, no secret, nothing to rotate.
 
-      # ── Log in to ACR ───────────────────────────────────────────────────────
       - name: Log in to Azure Container Registry
         run: az acr login --name ${{ secrets.ACR_NAME }}
-        # Uses the Azure access token from the OIDC login above.
-        # This authorises Docker to push images to ACR for the rest of this job.
+        # Uses the Azure token from the step above to authorise Docker push to ACR.
 
-      # ── Build and push backend image ────────────────────────────────────────
+      # ── Build and push backend ────────────────────────────────────────────────
       - name: Build and push backend image
         run: |
           IMAGE="${{ env.ACR_LOGIN_SERVER }}/backend"
+          PREFIX="${{ steps.meta.outputs.prefix }}"
           TAG="${{ steps.meta.outputs.tag }}"
 
+          # VITE_* are frontend-only; backend has no build args that vary by branch.
           docker build \
             --target production \
-            --tag "${IMAGE}:${TAG}" \
-            --tag "${IMAGE}:latest" \
+            --tag "${IMAGE}:${PREFIX}${TAG}" \
+            --tag "${IMAGE}:${PREFIX}latest" \
             ./backend
-          # --target production: uses the "production" stage from backend/Dockerfile.
-          # Runs gunicorn (not the Django dev server) as a non-root user.
-          # Tagged with both the git SHA and :latest.
-          # :latest makes kubectl rollout restart pick up the new image.
-          # :SHA lets you audit what's running and roll back if needed.
+          # --target production: gunicorn stage, non-root user (see backend/Dockerfile).
+          # SHA tag: lets you trace exactly which commit is running in any environment.
+          #          Roll back by setting this tag in the deployment — no rebuild needed.
+          # prefix-latest tag: used for human reference ("what's the latest QA build?").
 
-          docker push "${IMAGE}:${TAG}"
-          docker push "${IMAGE}:latest"
+          docker push "${IMAGE}:${PREFIX}${TAG}"
+          docker push "${IMAGE}:${PREFIX}latest"
 
-      # ── Build and push frontend image ───────────────────────────────────────
+      # ── Build and push frontend ───────────────────────────────────────────────
       - name: Build and push frontend image
         run: |
           IMAGE="${{ env.ACR_LOGIN_SERVER }}/frontend"
+          PREFIX="${{ steps.meta.outputs.prefix }}"
           TAG="${{ steps.meta.outputs.tag }}"
+          BRANCH="${{ github.ref_name }}"
+
+          # VITE_API_URL is baked into the JS bundle at build time (not a runtime var).
+          # It must match the public hostname of the API for each environment.
+          # Update these URLs to match your actual domain names.
+          if [[ "$BRANCH" == "main" ]]; then
+            VITE_API_URL="https://myapp.com"
+            VITE_ENV="production"
+          elif [[ "$BRANCH" == "staging" ]]; then
+            VITE_API_URL="https://staging.myapp.com"
+            VITE_ENV="staging"
+          else
+            VITE_API_URL="https://qa.myapp.com"
+            VITE_ENV="qa"
+          fi
 
           docker build \
             --target production \
-            --build-arg VITE_API_URL="https://myapp.com" \
-            --build-arg VITE_ENV="production" \
-            --tag "${IMAGE}:${TAG}" \
-            --tag "${IMAGE}:latest" \
+            --build-arg VITE_API_URL="${VITE_API_URL}" \
+            --build-arg VITE_ENV="${VITE_ENV}" \
+            --tag "${IMAGE}:${PREFIX}${TAG}" \
+            --tag "${IMAGE}:${PREFIX}latest" \
             ./frontend
-          # --target production: uses the "production" stage (nginx + pre-built React assets).
-          # --build-arg VITE_*: Vite bakes these into the compiled JS bundle at build time.
-          # They are NOT available as runtime env vars in the running container.
-          # Update VITE_API_URL to your actual production domain.
 
-          docker push "${IMAGE}:${TAG}"
-          docker push "${IMAGE}:latest"
+          docker push "${IMAGE}:${PREFIX}${TAG}"
+          docker push "${IMAGE}:${PREFIX}latest"
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # JOB 2: Deploy updated manifests to AKS
+  # JOB 2a: Deploy to QA
+  # Runs only on push to the qa branch.
   # ═══════════════════════════════════════════════════════════════════════════
-  deploy:
-    name: Deploy to AKS
+  deploy-qa:
+    name: Deploy to QA
     runs-on: ubuntu-latest
-    needs: build-and-push  # Only runs after build-and-push completes successfully.
-                           # If the build fails, deploy is skipped automatically.
-                           # This prevents deploying a broken image.
+    needs: build-and-push
+    if: github.ref_name == 'qa'
+    # if: ensures this job is silently skipped on main and staging pushes.
+    # It does not fail the workflow — the other deploy job simply runs instead.
 
     steps:
-      # ── Checkout (needed for k8s/ manifests) ───────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
+        # Needed to access the k8s/overlays/qa/ directory.
 
-      # ── Authenticate to Azure via OIDC ─────────────────────────────────────
       - name: Azure login (OIDC)
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-        # Same OIDC login as the build job. Each job gets its own fresh token —
-        # the token from the build job cannot be reused here.
+        # Each job gets a fresh OIDC token — tokens from other jobs cannot be reused.
 
-      # ── Configure kubectl ───────────────────────────────────────────────────
       - name: Set AKS context
         run: |
           az aks get-credentials \
             --resource-group ${{ secrets.AKS_RESOURCE_GROUP }} \
             --name ${{ secrets.AKS_CLUSTER_NAME }} \
             --overwrite-existing
-        # Downloads the kubeconfig for your AKS cluster and merges it into
-        # ~/.kube/config so kubectl commands in subsequent steps work.
-        # --overwrite-existing prevents failure if a stale config exists.
 
-      # ── Apply all Kubernetes manifests ──────────────────────────────────────
-      - name: Apply Kubernetes manifests
-        run: kubectl apply -f k8s/ --recursive
-        # Applies every .yaml file under k8s/ in a single command.
-        # --recursive walks subdirectories (backend/, frontend/, db/, redis/).
-        # kubectl apply is idempotent: it creates resources that don't exist
-        # and updates resources that do. Safe to run on every deploy.
-        #
-        # Apply order matters for dependencies:
-        # namespace.yaml must exist before namespace-scoped resources.
-        # kubectl apply --recursive handles files alphabetically per directory,
-        # so namespace.yaml (at root) is applied before subdirectory files.
-        # If you hit ordering errors, apply namespace.yaml separately first.
+      # ── Apply QA overlay ──────────────────────────────────────────────────────
+      - name: Apply QA manifests (Kustomize)
+        run: kubectl apply -k k8s/overlays/qa
+        # kubectl apply -k uses Kustomize to render the overlay and apply the result.
+        # This is equivalent to: kubectl kustomize k8s/overlays/qa | kubectl apply -f -
+        # The QA overlay sets namespace: qa, 1 replica, and smaller resource sizes.
+        # kubectl apply is idempotent — safe to re-run; it creates or updates as needed.
 
-      # ── Update image tags to trigger rolling updates ────────────────────────
-      - name: Update backend image tag
+      # ── Pin the exact image tag that was just built ───────────────────────────
+      - name: Pin backend image tag in QA
         run: |
-          TAG="${{ needs.build-and-push.outputs.image-tag }}"
-          kubectl set image deployment/backend \
-            backend=${{ env.ACR_LOGIN_SERVER }}/backend:${TAG} \
-            -n production
-        # kubectl apply -f alone does not force a new rollout if the deployment.yaml
-        # still references :latest and the image digest changed.
-        # kubectl set image patches the deployment with the exact SHA tag,
-        # which triggers a new rolling update even if no other YAML changed.
+          TAG="${{ needs.build-and-push.outputs.tag-prefix }}${{ needs.build-and-push.outputs.image-tag }}"
+          kubectl set image deployment/backend backend=${{ env.ACR_LOGIN_SERVER }}/backend:${TAG} -n qa
+        # kubectl apply -k sets the image to whatever is in the base deployment.yaml (:latest).
+        # This step overwrites it with the exact SHA tag built in this run.
+        # Without this, a pod restart could pull a different "latest" than what CI tested.
+        # With this, every pod in QA runs precisely the commit that triggered this workflow.
 
-      - name: Update frontend image tag
+      - name: Pin frontend image tag in QA
         run: |
-          TAG="${{ needs.build-and-push.outputs.image-tag }}"
-          kubectl set image deployment/frontend \
-            frontend=${{ env.ACR_LOGIN_SERVER }}/frontend:${TAG} \
-            -n production
+          TAG="${{ needs.build-and-push.outputs.tag-prefix }}${{ needs.build-and-push.outputs.image-tag }}"
+          kubectl set image deployment/frontend frontend=${{ env.ACR_LOGIN_SERVER }}/frontend:${TAG} -n qa
 
-      # ── Wait for rollouts to complete ───────────────────────────────────────
-      - name: Wait for backend rollout
+      # ── Wait for rollouts — pipeline fails here if pods crash ─────────────────
+      - name: Wait for backend rollout in QA
+        run: kubectl rollout status deployment/backend -n qa --timeout=5m
+        # rollout status blocks until all pods are running the new image AND passing
+        # their readiness probe (/api/health/ for the backend).
+        # If pods crash on startup (bad migration, OOMKilled, wrong config),
+        # rollout status exits non-zero and THIS STEP FAILS — the pipeline stops,
+        # GitHub marks the run as failed, and notifications fire immediately.
+        # A broken QA deploy will never silently pass as green.
+        # --timeout=5m: if no progress in 5 minutes, give up and fail the pipeline.
+        # Increase if your migrations are known to take longer.
+
+      - name: Wait for frontend rollout in QA
+        run: kubectl rollout status deployment/frontend -n qa --timeout=3m
+        # nginx starts in ~1 second. 3-minute timeout is very conservative.
+        # Failure here usually means: image pull error, resource quota exceeded,
+        # or node has insufficient capacity.
+
+      - name: Show QA pod status
+        if: always()   # Run even if a previous step failed — useful for debugging.
+        run: kubectl get pods -n qa
+        # Final visual confirmation. All pods should show Running / Ready (1/1 or 2/2).
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 2b: Deploy to Staging
+  # Runs only on push to the staging branch.
+  # ═══════════════════════════════════════════════════════════════════════════
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref_name == 'staging'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set AKS context
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ secrets.AKS_RESOURCE_GROUP }} \
+            --name ${{ secrets.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
+
+      # ── Apply staging overlay ─────────────────────────────────────────────────
+      - name: Apply staging manifests (Kustomize)
+        run: kubectl apply -k k8s/overlays/staging
+        # Staging overlay: namespace: staging, 2 replicas, medium resource sizes.
+        # Running 2 replicas means rolling updates are tested — same as production.
+        # If a rolling update fails in staging, it will fail in production too.
+        # Find it here, not there.
+
+      - name: Pin backend image tag in staging
+        run: |
+          TAG="${{ needs.build-and-push.outputs.tag-prefix }}${{ needs.build-and-push.outputs.image-tag }}"
+          kubectl set image deployment/backend backend=${{ env.ACR_LOGIN_SERVER }}/backend:${TAG} -n staging
+
+      - name: Pin frontend image tag in staging
+        run: |
+          TAG="${{ needs.build-and-push.outputs.tag-prefix }}${{ needs.build-and-push.outputs.image-tag }}"
+          kubectl set image deployment/frontend frontend=${{ env.ACR_LOGIN_SERVER }}/frontend:${TAG} -n staging
+
+      # ── Wait for rollouts — pipeline fails here if pods crash ─────────────────
+      - name: Wait for backend rollout in staging
+        run: kubectl rollout status deployment/backend -n staging --timeout=5m
+        # Same guarantee as QA: if the deploy is broken, this step fails,
+        # the pipeline fails, and you are notified before it reaches production.
+        # Staging is the last gate before main — treat failures here seriously.
+
+      - name: Wait for frontend rollout in staging
+        run: kubectl rollout status deployment/frontend -n staging --timeout=3m
+
+      - name: Show staging pod status
+        if: always()
+        run: kubectl get pods -n staging
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 2c: Deploy to Production
+  # Runs only on push to main.
+  # ═══════════════════════════════════════════════════════════════════════════
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref_name == 'main'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set AKS context
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ secrets.AKS_RESOURCE_GROUP }} \
+            --name ${{ secrets.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
+
+      # ── Apply production overlay ──────────────────────────────────────────────
+      - name: Apply production manifests (Kustomize)
+        run: kubectl apply -k k8s/overlays/production
+        # Production overlay: namespace: production, 2 replicas, full resource sizes.
+        # kubectl apply is idempotent — existing resources are updated in-place.
+        # New resources (first deploy) are created. Nothing is deleted by apply alone.
+
+      - name: Pin backend image tag in production
+        run: |
+          TAG="${{ needs.build-and-push.outputs.tag-prefix }}${{ needs.build-and-push.outputs.image-tag }}"
+          kubectl set image deployment/backend backend=${{ env.ACR_LOGIN_SERVER }}/backend:${TAG} -n production
+        # TAG for production has no prefix (prefix is ""), so this resolves to just the SHA:
+        # e.g. backend:a1b2c3d — the exact commit that passed QA and staging before reaching here.
+
+      - name: Pin frontend image tag in production
+        run: |
+          TAG="${{ needs.build-and-push.outputs.tag-prefix }}${{ needs.build-and-push.outputs.image-tag }}"
+          kubectl set image deployment/frontend frontend=${{ env.ACR_LOGIN_SERVER }}/frontend:${TAG} -n production
+
+      # ── Wait for rollouts — pipeline fails here if pods crash ─────────────────
+      - name: Wait for backend rollout in production
         run: kubectl rollout status deployment/backend -n production --timeout=5m
-        # What rollout status does:
-        #   Blocks the pipeline until all backend pods are running the new image
-        #   AND passing their readiness probe.
-        #   If a pod crashes on startup (OOMKilled, failed migration, bad config),
-        #   rollout status reports a failure and this step fails.
-        #   This means the pipeline itself fails and alerts you (via GitHub
-        #   notifications or your Slack/email integrations) BEFORE you close
-        #   your laptop and walk away from a broken deploy.
-        #   Without this step, a broken deploy would silently succeed in CI
-        #   while pods crash-loop in production.
-        # --timeout=5m: if the rollout hasn't completed in 5 minutes, fail the
-        # pipeline. Adjust if your migrations normally take longer.
+        # This is the production safety gate.
+        # If a pod fails its readiness probe (/api/health/) during rollout:
+        #   - Kubernetes pauses the rolling update
+        #   - The old pods keep serving traffic (zero downtime preserved)
+        #   - rollout status exits non-zero after --timeout
+        #   - This step fails → the pipeline fails → you are immediately notified
+        # The deploy is NOT automatically rolled back — Kubernetes holds the
+        # partial rollout until you manually run: kubectl rollout undo deployment/backend -n production
+        # This prevents automated rollbacks from masking the root cause.
 
-      - name: Wait for frontend rollout
+      - name: Wait for frontend rollout in production
         run: kubectl rollout status deployment/frontend -n production --timeout=3m
-        # Frontend (nginx) starts in ~1 second, so 3 minutes is very generous.
-        # If this times out, something is seriously wrong with the image or
-        # the node has insufficient resources to schedule the pod.
 
-      # ── Verify final state ──────────────────────────────────────────────────
-      - name: Show deployed pod status
+      - name: Show production pod status
+        if: always()
         run: kubectl get pods -n production
-        # Prints the final pod status to the pipeline log for visual confirmation.
-        # All pods should show Running / Ready. This step always succeeds —
-        # it is informational only.
-        if: always()  # Run even if a previous step failed, so you can see pod state
-                      # in the logs when debugging a failed deploy.

@@ -1,0 +1,192 @@
+# overlays/staging/kustomization.yaml — Staging environment overlay.
+#
+# What this file does:
+#   Takes everything from k8s/base/ and applies staging-specific overrides:
+#   2 replicas (same as production), medium resource sizes, and the "staging" namespace.
+#   Goal: production-like behaviour at a lower cost.
+#
+# How to deploy to staging:
+#   kubectl apply -k k8s/overlays/staging
+#
+# How to preview manifests without applying:
+#   kubectl kustomize k8s/overlays/staging
+#
+# How to verify after deploy:
+#   kubectl get all -n staging
+#   kubectl get hpa -n staging
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ── Namespace ──────────────────────────────────────────────────────────────────
+# Sets metadata.namespace: staging on all namespaced resources.
+# The Namespace resource's metadata.name is patched separately below.
+namespace: staging
+
+# ── Base layer ─────────────────────────────────────────────────────────────────
+resources:
+  - ../../base   # Inherits all 17 resource files from k8s/base/.
+
+# ── Patches ────────────────────────────────────────────────────────────────────
+patches:
+
+  # ── Rename the Namespace resource ─────────────────────────────────────────────
+  - target:
+      kind: Namespace
+      name: production
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: staging       # Creates the "staging" namespace instead of "production".
+
+  # ── Backend Deployment — replicas + resources ──────────────────────────────────
+  - target:
+      kind: Deployment
+      name: backend
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: backend
+      spec:
+        replicas: 2          # Staging: 2 replicas — same as production.
+                             # This ensures rolling updates and multi-pod behaviour
+                             # are tested before changes reach production.
+        template:
+          spec:
+            containers:
+              - name: backend
+                resources:
+                  requests:
+                    cpu: "200m"     # 0.2 core — between QA (100m) and production (250m).
+                    memory: "200Mi" # 200MB — sized for integration test load.
+                  limits:
+                    cpu: "400m"     # 2× request. Staging can burst during load tests.
+                    memory: "400Mi" # 2× request. Watch for OOMKilled if limit tests run.
+
+  # ── Frontend Deployment — replicas + resources ────────────────────────────────
+  - target:
+      kind: Deployment
+      name: frontend
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: frontend
+      spec:
+        replicas: 2          # Same as production — validates rolling update behaviour.
+        template:
+          spec:
+            containers:
+              - name: frontend
+                resources:
+                  requests:
+                    cpu: "200m"
+                    memory: "200Mi"
+                  limits:
+                    cpu: "400m"
+                    memory: "400Mi"
+
+  # ── DB Deployment — resources only ────────────────────────────────────────────
+  - target:
+      kind: Deployment
+      name: db
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: db
+      spec:
+        template:
+          spec:
+            containers:
+              - name: postgres
+                resources:
+                  requests:
+                    cpu: "200m"     # Staging DB: handles integration test write load.
+                    memory: "200Mi" # Slightly above default shared_buffers (128MB).
+                  limits:
+                    cpu: "400m"
+                    memory: "400Mi"
+
+  # ── Redis Deployment — resources only ─────────────────────────────────────────
+  - target:
+      kind: Deployment
+      name: redis
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: redis
+      spec:
+        template:
+          spec:
+            containers:
+              - name: redis
+                resources:
+                  requests:
+                    cpu: "200m"
+                    memory: "200Mi"
+                  limits:
+                    cpu: "400m"
+                    memory: "400Mi" # Limit raised to 400Mi — also patch maxmemory below.
+
+  # ── Redis command args — adjust maxmemory for staging limits ──────────────────
+  # Base sets --maxmemory 400mb which fits within the 400Mi limit here (400mb ≈ 381Mi).
+  # Patch it to 320mb to leave a safe margin below the 400Mi hard cap.
+  - target:
+      kind: Deployment
+      name: redis
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: redis
+      spec:
+        template:
+          spec:
+            containers:
+              - name: redis
+                args:
+                  - "--maxmemory"
+                  - "320mb"           # Evict LRU keys at 320MB — safely below the 400Mi limit.
+                  - "--maxmemory-policy"
+                  - "allkeys-lru"
+                  - "--save"
+                  - ""
+
+  # ── Backend HPA — staging scale thresholds ────────────────────────────────────
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: backend-hpa
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2             # Staging: same minimum as production — always 2 pods running.
+      - op: replace
+        path: /spec/maxReplicas
+        value: 6             # Staging: half of production's ceiling. Enough for load tests.
+      - op: replace
+        path: /spec/metrics/0/resource/target/averageUtilization
+        value: 65            # Staging CPU target: 65% — tighter than QA, looser than prod.
+      - op: replace
+        path: /spec/metrics/1/resource/target/averageUtilization
+        value: 75            # Staging memory target: 75%.
+
+  # ── Frontend HPA — staging scale thresholds ───────────────────────────────────
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: frontend-hpa
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 6
+      - op: replace
+        path: /spec/metrics/0/resource/target/averageUtilization
+        value: 65
+      - op: replace
+        path: /spec/metrics/1/resource/target/averageUtilization
+        value: 75

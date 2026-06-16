@@ -1,0 +1,64 @@
+# overlays/staging/values.yaml — Environment profile for staging.
+#
+# Purpose of this file:
+#   Human-readable specification for the staging environment.
+#   Documents every tunable value so the team can understand staging's
+#   behaviour at a glance and compare it against QA and production.
+#
+# ⚠️  This file is documentation, not configuration.
+#   Kustomize does not read this file — it reads kustomization.yaml.
+#   When you change a value here, also update the matching patch in kustomization.yaml.
+#
+# Philosophy for staging:
+#   Staging mirrors production as closely as the budget allows.
+#   It runs 2 replicas per service (same as production) to catch issues that
+#   only surface under concurrent load or during rolling updates.
+#   Resource sizes are slightly smaller than production — real users never
+#   hit staging so peak load is lower, but the pod count and rolling update
+#   behaviour is identical.
+#   Deploy to staging first, validate, then promote to production.
+
+environment: staging   # Determines the namespace: "staging"
+                       # kubectl get pods -n staging
+
+namespace: staging     # Fully isolated from QA and production.
+                       # Same cluster, different namespace = no cross-env interference.
+
+replicas: 2            # Two pods per service — same as production.
+                       # This is the most important staging property: rolling updates,
+                       # pod anti-affinity, and concurrent request handling all behave
+                       # exactly as they would in production. 1 replica would hide
+                       # issues that only appear with 2+ pods (e.g. session affinity,
+                       # race conditions, cache invalidation across pods).
+
+resources:
+  requests:
+    cpu: "200m"        # 0.2 CPU core reserved per pod.
+                       # Between QA (100m) and production (250m).
+                       # Staging traffic is pre-production validation — more sustained
+                       # than QA tests but not real user scale.
+                       # If pods are CPU-throttled during staging load tests, raise to 250m.
+    memory: "200Mi"    # 200MB reserved per pod.
+                       # Enough for gunicorn under light-to-moderate load.
+                       # Raise to 256Mi if staging tests trigger OOMKilled events.
+  limits:
+    cpu: "400m"        # 2× the request. Throttled if exceeded.
+                       # Staging occasionally runs integration test suites that spike CPU.
+    memory: "400Mi"    # 2× the request. OOMKilled if exceeded.
+                       # Gives reasonable headroom above the 200Mi request.
+
+hpa:
+  minReplicas: 2       # Never drop below 2 pods — same as production.
+                       # Staging must behave like production during scale-down events
+                       # to catch issues (e.g. session state lost when pod is removed).
+  maxReplicas: 6       # Max 6 pods — half of production's ceiling (10).
+                       # Enough headroom for staging load tests while controlling cost.
+                       # Staging load tests should not exceed production-scale traffic.
+  cpuTarget: 65        # Scale at 65% CPU utilisation.
+                       # Between QA (70%) and production (60%).
+                       # Staging validates real traffic patterns; tighter scaling gives
+                       # more realistic pre-production performance data.
+  memoryTarget: 75     # Scale at 75% memory utilisation.
+                       # Between QA (80%) and production (70%).
+                       # Gives slightly less headroom than production, which is acceptable
+                       # since staging doesn't serve real users during memory spikes.

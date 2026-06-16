@@ -1,0 +1,56 @@
+# overlays/production/values.yaml — Environment profile for production.
+#
+# Purpose of this file:
+#   Human-readable specification for the production environment.
+#   These values also serve as the base defaults — the base layer was originally
+#   written with production sizing in mind, so the production overlay confirms
+#   rather than significantly changes what the base already specifies.
+#
+# ⚠️  This file is documentation, not configuration.
+#   Kustomize does not read this file — it reads kustomization.yaml.
+#   When you change a value here, also update the matching patch in kustomization.yaml.
+#
+# Philosophy for production:
+#   Never compromise on stability. Production serves real users and has real cost
+#   of downtime. Size conservatively, scale proactively, and never run a single
+#   point of failure for stateless services. Changes should be deployed to staging
+#   first and validated before they touch this environment.
+
+environment: production  # Namespace: "production"
+                         # kubectl get pods -n production
+
+namespace: production    # The "production" namespace is also the default in base.
+                         # The production overlay still sets it explicitly to be
+                         # consistent with the other overlays and self-documenting.
+
+replicas: 2              # Two pods per service at all times.
+                         # During a rolling update Kubernetes keeps at least 1 pod
+                         # serving while the other is replaced — zero-downtime deploys.
+                         # 1 pod would mean a gap in availability on every deploy or crash.
+                         # Increase to 3+ if baseline traffic requires more capacity.
+
+resources:
+  requests:
+    cpu: "250m"          # 0.25 core reserved per pod. The scheduler uses this to place
+                         # pods on nodes that have capacity. Sized for gunicorn under
+                         # moderate real-user load. Increase if you see consistent throttling.
+    memory: "256Mi"      # 256MB reserved. Gunicorn with 4 workers uses 150-300MB in practice.
+                         # Increase to 384Mi if OOMKilled events appear in pod describe output.
+  limits:
+    cpu: "500m"          # 0.5 core hard cap. Throttled (not killed) if exceeded.
+                         # 2× the request as a safe burst allowance for spiky endpoints.
+    memory: "512Mi"      # 512MB hard cap. OOMKilled if exceeded — increase if you see
+                         # OOMKilled in kubectl describe pod output. Never ignore OOMKills.
+
+hpa:
+  minReplicas: 2         # Floor at 2. Even at zero traffic, 2 pods ensures one survives
+                         # a node drain, eviction, or single pod crash without downtime.
+  maxReplicas: 10        # Ceiling at 10. Based on node capacity and expected peak traffic.
+                         # If all 10 pods are at 90% CPU, increase this AND consider adding
+                         # nodes via AKS Cluster Autoscaler.
+  cpuTarget: 60          # Scale when average CPU across pods exceeds 60% of their request.
+                         # At 60%, each pod has 40% headroom while new pods are starting.
+                         # New pods take 60-90s; scaling at 60% means users never feel it.
+  memoryTarget: 70       # Scale when average memory across pods exceeds 70% of their request.
+                         # Memory does not compress — scale before the hard limit (512Mi)
+                         # is approached. 70% leaves ~76Mi of buffer per pod.

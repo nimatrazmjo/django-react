@@ -1,0 +1,64 @@
+# overlays/qa/values.yaml — Environment profile for QA.
+#
+# Purpose of this file:
+#   This is the human-readable specification for the QA environment.
+#   It documents every tunable value in one place so anyone on the team
+#   can understand what QA looks like at a glance.
+#
+# ⚠️  This file is documentation, not configuration.
+#   Kustomize does not read this file — it reads kustomization.yaml.
+#   When you change a value here, you MUST also update the corresponding
+#   patch in kustomization.yaml to match. Both files live in this folder.
+#
+# Philosophy for QA:
+#   QA is a functional environment for catching bugs, not a performance env.
+#   Cost matters more than headroom — we run single replicas and small pods
+#   because QA traffic is synthetic (automated tests, manual spot-checks).
+#   No real users are affected if a QA pod restarts or slows down.
+
+environment: qa        # Determines the namespace: "qa"
+                       # Pods land in: kubectl get pods -n qa
+
+namespace: qa          # All resources are deployed into this namespace.
+                       # Completely isolated from staging and production.
+                       # kubectl delete namespace qa tears everything down cleanly.
+
+replicas: 1            # One pod per service.
+                       # No redundancy needed — QA has no SLA.
+                       # Saves roughly 50% of node cost vs production's 2 replicas.
+                       # If the pod crashes, tests fail and the team notices immediately.
+
+resources:
+  requests:
+    cpu: "100m"        # 0.1 CPU core reserved per pod.
+                       # QA workloads are light (test requests, not real user traffic).
+                       # Lower request = more pods fit on fewer nodes = lower cluster cost.
+                       # If pods are constantly CPU-throttled in QA, raise to 150m.
+    memory: "128Mi"    # 128MB reserved per pod.
+                       # Enough for Django/gunicorn idle + a small request queue.
+                       # Raise to 192Mi if you see OOMKilled in QA pod events.
+  limits:
+    cpu: "200m"        # Hard cap at 0.2 CPU. Throttled (not killed) if exceeded.
+                       # Set to 2× the request as a burst allowance.
+                       # QA pods should not need to burst — if they do consistently,
+                       # the request value is too low, not the limit.
+    memory: "256Mi"    # Hard cap at 256MB. OOMKilled if exceeded.
+                       # Double the request to allow for brief memory spikes
+                       # (e.g. Django loading a large fixture during tests).
+
+hpa:
+  minReplicas: 1       # Never scale below 1 pod.
+                       # In QA, 0 pods during idle would save cost but break
+                       # automated test suites that assume the service is always up.
+                       # 1 is the minimum functional value.
+  maxReplicas: 3       # Cap at 3 pods regardless of load.
+                       # QA tests should not generate enough traffic to warrant more.
+                       # If you hit this ceiling, investigate runaway test loops.
+  cpuTarget: 70        # Scale when average CPU exceeds 70% of the request (70m per pod).
+                       # Higher threshold than production (60%) — in QA we let pods work
+                       # harder before scaling because cost matters more than response time.
+                       # New pods still take 60-90s to start, but QA tests can tolerate that.
+  memoryTarget: 80     # Scale when average memory exceeds 80% of the request (102Mi per pod).
+                       # Higher than production (70%) for the same cost reasoning.
+                       # Memory OOMKill is still the hard floor — 80% leaves 20% headroom
+                       # before hitting the 256Mi limit.

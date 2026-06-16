@@ -1,0 +1,62 @@
+# base/kustomization.yaml — The single source of truth for all Kubernetes resources.
+#
+# What this file does:
+#   Tells Kustomize which resource files belong to this base layer.
+#   Every overlay (qa, staging, production) points to this base and inherits
+#   all resources listed here. Overlays then apply targeted patches to override
+#   only what differs between environments — replica counts, resource sizes,
+#   namespace — without duplicating any of these files.
+#
+# What lives here vs in overlays:
+#   Base (here)        — WHAT your cluster runs: Deployments, Services, HPAs,
+#                        ConfigMap, Secret template, Ingress, Namespace template.
+#   Overlays           — HOW MUCH it runs: replica count, CPU/memory per env,
+#                        HPA thresholds, and which namespace to land in.
+#
+# How Kustomize processes this:
+#   kubectl apply -k k8s/overlays/<env>
+#   Kustomize reads the overlay's kustomization.yaml, which points here.
+#   It loads every file in this resources list, then applies the overlay's
+#   patches on top. The result is a merged set of manifests sent to kubectl.
+#
+# How to render the final manifests for an env without applying them:
+#   kubectl kustomize k8s/overlays/qa        # preview QA output
+#   kubectl kustomize k8s/overlays/staging   # preview staging output
+#   kubectl kustomize k8s/overlays/production
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  # ── Cluster-scoped ────────────────────────────────────────────────────────────
+  - namespace.yaml      # Creates the namespace. Name is overridden per overlay.
+
+  # ── Shared config ─────────────────────────────────────────────────────────────
+  - configmap.yaml      # Non-sensitive env vars (DJANGO_SETTINGS_MODULE, ALLOWED_HOSTS, etc.)
+  - secrets.yaml        # Secret placeholder template — real values injected before first deploy
+
+  # ── Ingress ───────────────────────────────────────────────────────────────────
+  - ingress.yaml        # nginx ingress: routes /api/* → backend, /* → frontend
+                        # Note: the host field (myapp.com) should be patched per env
+                        # in each overlay if you use per-env subdomains.
+
+  # ── Backend (Django/Gunicorn) ─────────────────────────────────────────────────
+  - backend/deployment.yaml  # 2 replicas, gunicorn, probes on /api/health/
+  - backend/service.yaml     # ClusterIP, port 8000
+  - backend/hpa.yaml         # Autoscale 2–10 on CPU (60%) and memory (70%)
+
+  # ── Frontend (nginx + React static files) ────────────────────────────────────
+  - frontend/deployment.yaml  # 2 replicas, nginx, probes on /health
+  - frontend/service.yaml     # ClusterIP, port 80
+  - frontend/hpa.yaml         # Autoscale 2–10 on CPU (60%) and memory (70%)
+
+  # ── PostgreSQL ────────────────────────────────────────────────────────────────
+  - db/pvc.yaml         # 20Gi Azure Premium SSD for postgres data
+  - db/deployment.yaml  # postgres:16-alpine, 1 replica (Recreate strategy)
+  - db/service.yaml     # ClusterIP, port 5432
+  - db/hpa.yaml         # Locked to 1 replica — signals CPU pressure, cannot scale out
+
+  # ── Redis ─────────────────────────────────────────────────────────────────────
+  - redis/deployment.yaml  # redis:7-alpine, 1 replica, maxmemory 400mb
+  - redis/service.yaml     # ClusterIP, port 6379
+  - redis/hpa.yaml         # Locked to 1 replica — signals memory pressure, cannot scale out

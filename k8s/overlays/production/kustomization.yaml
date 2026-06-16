@@ -1,0 +1,170 @@
+# overlays/production/kustomization.yaml — Production environment overlay.
+#
+# What this file does:
+#   Takes everything from k8s/base/ and applies the production profile.
+#   The base layer was originally written with production values, so this overlay
+#   largely confirms those values. It exists to be consistent with the other
+#   overlays and to make the production profile explicit and self-documenting.
+#
+# Deploy only via CI/CD — never apply to production manually.
+# The GitHub Actions pipeline (push to main) is the only sanctioned deploy path.
+#
+# Emergency manual deploy (break-glass only):
+#   kubectl apply -k k8s/overlays/production
+#
+# How to preview manifests without applying:
+#   kubectl kustomize k8s/overlays/production
+#
+# How to verify after deploy:
+#   kubectl get all -n production
+#   kubectl get hpa -n production
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ── Namespace ──────────────────────────────────────────────────────────────────
+# Sets metadata.namespace: production on all namespaced resources.
+# The base files already have namespace: production, so this is a no-op for
+# namespaced resources — but it is explicit and makes the overlay self-contained.
+namespace: production
+
+# ── Base layer ─────────────────────────────────────────────────────────────────
+resources:
+  - ../../base   # Inherits all 17 resource files from k8s/base/.
+
+# ── Patches ────────────────────────────────────────────────────────────────────
+# Production's namespace name matches the base default, so no Namespace rename
+# patch is needed here (unlike QA and staging which must rename from "production").
+#
+# The resource patches below are technically redundant with the base values,
+# but they make this file self-documenting: you can read this file alone and
+# know exactly what production runs, without cross-referencing base files.
+patches:
+
+  # ── Backend Deployment — replicas + resources ──────────────────────────────────
+  - target:
+      kind: Deployment
+      name: backend
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: backend
+      spec:
+        replicas: 2          # Production: 2 replicas minimum for zero-downtime rolling updates.
+                             # HPA scales this up to maxReplicas (10) under load.
+        template:
+          spec:
+            containers:
+              - name: backend
+                resources:
+                  requests:
+                    cpu: "250m"     # 0.25 core — sized for gunicorn under real user traffic.
+                    memory: "256Mi" # 256MB — confirmed by Gunicorn 4-worker baseline usage.
+                  limits:
+                    cpu: "500m"     # 2× request. Throttled on burst, not killed.
+                    memory: "512Mi" # Hard cap. OOMKilled if exceeded — monitor in production.
+
+  # ── Frontend Deployment — replicas + resources ────────────────────────────────
+  - target:
+      kind: Deployment
+      name: frontend
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: frontend
+      spec:
+        replicas: 2
+        template:
+          spec:
+            containers:
+              - name: frontend
+                resources:
+                  requests:
+                    cpu: "250m"
+                    memory: "256Mi"
+                  limits:
+                    cpu: "500m"
+                    memory: "512Mi"
+
+  # ── DB Deployment — resources only ────────────────────────────────────────────
+  - target:
+      kind: Deployment
+      name: db
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: db
+      spec:
+        template:
+          spec:
+            containers:
+              - name: postgres
+                resources:
+                  requests:
+                    cpu: "250m"     # Production DB: sized for real query load.
+                    memory: "256Mi" # Covers default shared_buffers + overhead.
+                  limits:
+                    cpu: "500m"
+                    memory: "512Mi" # If you tune shared_buffers above 128MB, raise this.
+
+  # ── Redis Deployment — resources only ─────────────────────────────────────────
+  - target:
+      kind: Deployment
+      name: redis
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: redis
+      spec:
+        template:
+          spec:
+            containers:
+              - name: redis
+                resources:
+                  requests:
+                    cpu: "250m"
+                    memory: "256Mi"
+                  limits:
+                    cpu: "500m"
+                    memory: "512Mi" # Base sets --maxmemory 400mb, well below this 512Mi cap.
+                                    # 112MB headroom between maxmemory eviction and OOMKill.
+
+  # ── Backend HPA — production scale thresholds ─────────────────────────────────
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: backend-hpa
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2             # Production: never drop below 2. Single pod = single point of failure.
+      - op: replace
+        path: /spec/maxReplicas
+        value: 10            # Production ceiling. If all 10 pods are saturated, add nodes.
+      - op: replace
+        path: /spec/metrics/0/resource/target/averageUtilization
+        value: 60            # Production CPU target: 60% — scale early, users never feel lag.
+      - op: replace
+        path: /spec/metrics/1/resource/target/averageUtilization
+        value: 70            # Production memory target: 70% — scale before OOMKill territory.
+
+  # ── Frontend HPA — production scale thresholds ────────────────────────────────
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: frontend-hpa
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 10
+      - op: replace
+        path: /spec/metrics/0/resource/target/averageUtilization
+        value: 60
+      - op: replace
+        path: /spec/metrics/1/resource/target/averageUtilization
+        value: 70

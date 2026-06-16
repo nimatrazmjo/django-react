@@ -1,0 +1,211 @@
+# overlays/qa/kustomization.yaml — QA environment overlay.
+#
+# What this file does:
+#   Takes everything from k8s/base/ and overrides only what differs in QA:
+#   namespace, replica counts, resource requests/limits, and HPA thresholds.
+#   No base files are copied or duplicated — all shared config is inherited.
+#
+# How to deploy to QA:
+#   kubectl apply -k k8s/overlays/qa
+#
+# How to preview what will be applied without touching the cluster:
+#   kubectl kustomize k8s/overlays/qa
+#
+# How to verify after deploy:
+#   kubectl get all -n qa
+#   kubectl get hpa -n qa
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ── Namespace ──────────────────────────────────────────────────────────────────
+# Kustomize sets metadata.namespace: qa on every namespaced resource
+# (Deployments, Services, HPAs, ConfigMap, Secret, PVC, Ingress).
+# Resources that are cluster-scoped (like Namespace itself) are unaffected
+# by this field — the namespace.yaml name is patched separately below.
+namespace: qa
+
+# ── Base layer ─────────────────────────────────────────────────────────────────
+resources:
+  - ../../base   # Inherits all 17 resource files from k8s/base/.
+                 # Path is relative to this file.
+
+# ── Patches ────────────────────────────────────────────────────────────────────
+# Each patch targets a specific resource by kind+name and overrides only the
+# fields that differ from the base. Everything not mentioned here is inherited
+# unchanged from base. Strategic merge patches are used for scalar fields;
+# JSON 6902 patches (op/path/value) are used for array index operations.
+patches:
+
+  # ── Rename the Namespace resource ─────────────────────────────────────────────
+  # Kustomize's namespace: field above changes metadata.namespace on namespaced
+  # resources but does NOT change metadata.name on a Namespace resource itself
+  # (Namespace is cluster-scoped — it has no namespace). This JSON patch handles that.
+  - target:
+      kind: Namespace
+      name: production       # Matches base namespace.yaml where name: production
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: qa            # Creates the "qa" namespace instead of "production".
+
+  # ── Backend Deployment — replicas + resources ──────────────────────────────────
+  - target:
+      kind: Deployment
+      name: backend
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: backend
+      spec:
+        replicas: 1          # QA: single pod — no redundancy needed, saves cost.
+                             # Production uses 2 for zero-downtime rolling updates.
+        template:
+          spec:
+            containers:
+              - name: backend
+                resources:
+                  requests:
+                    cpu: "100m"     # QA: 0.1 core — light synthetic traffic only.
+                    memory: "128Mi" # QA: 128MB — enough for gunicorn idle + test requests.
+                  limits:
+                    cpu: "200m"     # 2× request. Throttled if exceeded, not killed.
+                    memory: "256Mi" # Hard cap. OOMKilled if exceeded — raise if tests OOMKill.
+
+  # ── Frontend Deployment — replicas + resources ────────────────────────────────
+  - target:
+      kind: Deployment
+      name: frontend
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: frontend
+      spec:
+        replicas: 1          # QA: single nginx pod. Static file serving is stateless;
+                             # if it restarts, it recovers in ~1 second.
+        template:
+          spec:
+            containers:
+              - name: frontend
+                resources:
+                  requests:
+                    cpu: "100m"
+                    memory: "128Mi"
+                  limits:
+                    cpu: "200m"
+                    memory: "256Mi"
+
+  # ── DB Deployment — resources only (replicas stay at 1 in all envs) ───────────
+  - target:
+      kind: Deployment
+      name: db
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: db
+      spec:
+        template:
+          spec:
+            containers:
+              - name: postgres
+                resources:
+                  requests:
+                    cpu: "100m"     # QA DB: very light — test data is small.
+                    memory: "128Mi" # Enough for postgres default shared_buffers (128MB).
+                  limits:
+                    cpu: "200m"
+                    memory: "256Mi"
+
+  # ── Redis Deployment — resources only (replicas stay at 1 in all envs) ────────
+  - target:
+      kind: Deployment
+      name: redis
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: redis
+      spec:
+        template:
+          spec:
+            containers:
+              - name: redis
+                resources:
+                  requests:
+                    cpu: "100m"     # QA Redis: minimal — cache is tiny in test runs.
+                    memory: "128Mi" # Well above the --maxmemory 400mb... wait, the base
+                                    # sets --maxmemory 400mb but that is above this 128Mi
+                                    # request. The limit below caps it before redis hits 400mb.
+                                    # For QA, also patch --maxmemory to stay within limits:
+                                    # see the command args patch below.
+                  limits:
+                    cpu: "200m"
+                    memory: "256Mi" # Redis OOMKilled at 256Mi — maxmemory patched to 200mb
+                                    # below so Redis evicts before hitting this hard cap.
+
+  # ── Redis command args — lower maxmemory to stay within QA memory limits ──────
+  # The base redis deployment sets --maxmemory 400mb which exceeds the 256Mi limit
+  # above. Patch it down to 200mb so Redis evicts keys before hitting the OOM wall.
+  - target:
+      kind: Deployment
+      name: redis
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: redis
+      spec:
+        template:
+          spec:
+            containers:
+              - name: redis
+                args:
+                  - "--maxmemory"
+                  - "200mb"           # Evict LRU keys at 200MB, well under the 256Mi limit.
+                                      # Production uses 400mb (base value) to match its 512Mi limit.
+                  - "--maxmemory-policy"
+                  - "allkeys-lru"     # Same eviction policy as base — kept consistent.
+                  - "--save"
+                  - ""                # Persistence still disabled — no PVC for redis in any env.
+
+  # ── Backend HPA — scale thresholds ────────────────────────────────────────────
+  # JSON 6902 patch used for array index paths (/spec/metrics/0, /spec/metrics/1)
+  # because strategic merge patch cannot reliably target list items by index.
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: backend-hpa
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 1             # QA: allow HPA to scale to 1 minimum (matches deployment replicas).
+      - op: replace
+        path: /spec/maxReplicas
+        value: 3             # QA: hard ceiling at 3 — runaway test traffic should not cost more.
+      - op: replace
+        path: /spec/metrics/0/resource/target/averageUtilization
+        value: 70            # QA CPU target: 70% (vs 60% in prod). Let pods work harder
+                             # before scaling since QA cost matters more than response time.
+      - op: replace
+        path: /spec/metrics/1/resource/target/averageUtilization
+        value: 80            # QA memory target: 80% (vs 70% in prod). Same cost reasoning.
+
+  # ── Frontend HPA — scale thresholds ───────────────────────────────────────────
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: frontend-hpa
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 1
+      - op: replace
+        path: /spec/maxReplicas
+        value: 3
+      - op: replace
+        path: /spec/metrics/0/resource/target/averageUtilization
+        value: 70
+      - op: replace
+        path: /spec/metrics/1/resource/target/averageUtilization
+        value: 80

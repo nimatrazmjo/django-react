@@ -1,6 +1,6 @@
 # Kubernetes Configuration for AKS
 
-Production Kubernetes manifests for the Django + React application on Azure Kubernetes Service.
+Production-ready Kubernetes manifests for the Django + React application, structured with Kustomize for multi-environment support (QA, Staging, Production) with zero file duplication.
 
 ---
 
@@ -8,36 +8,113 @@ Production Kubernetes manifests for the Django + React application on Azure Kube
 
 ```
 k8s/
-├── namespace.yaml          # Creates the "production" namespace
-├── configmap.yaml          # Non-sensitive environment variables
-├── secrets.yaml            # Placeholder template for sensitive values
-├── ingress.yaml            # Single public entry point (nginx ingress controller)
+├── base/                          # Single source of truth — shared across all environments
+│   ├── kustomization.yaml         # Lists every resource file in this base layer
+│   ├── namespace.yaml             # Namespace template (name is overridden per overlay)
+│   ├── configmap.yaml             # Non-sensitive env vars
+│   ├── secrets.yaml               # Secret placeholder template
+│   ├── ingress.yaml               # nginx ingress: /api/* → backend, /* → frontend
+│   ├── backend/
+│   │   ├── deployment.yaml        # Django/Gunicorn — probes on /api/health/
+│   │   ├── service.yaml           # ClusterIP, port 8000
+│   │   └── hpa.yaml               # CPU + memory autoscaling
+│   ├── frontend/
+│   │   ├── deployment.yaml        # nginx serving React static files — probes on /health
+│   │   ├── service.yaml           # ClusterIP, port 80
+│   │   └── hpa.yaml
+│   ├── db/
+│   │   ├── pvc.yaml               # 20Gi Azure Premium SSD
+│   │   ├── deployment.yaml        # postgres:16-alpine, 1 replica (Recreate strategy)
+│   │   ├── service.yaml           # ClusterIP, port 5432
+│   │   └── hpa.yaml               # Locked to 1 replica
+│   └── redis/
+│       ├── deployment.yaml        # redis:7-alpine, 1 replica, maxmemory 400mb
+│       ├── service.yaml           # ClusterIP, port 6379
+│       └── hpa.yaml               # Locked to 1 replica
 │
-├── backend/
-│   ├── deployment.yaml     # Django/Gunicorn — 2 replicas
-│   ├── service.yaml        # ClusterIP — internal only, port 8000
-│   └── hpa.yaml            # Auto-scales 2–10 pods on CPU/memory
-│
-├── frontend/
-│   ├── deployment.yaml     # nginx serving React static files — 2 replicas
-│   ├── service.yaml        # ClusterIP — internal only, port 80
-│   └── hpa.yaml            # Auto-scales 2–10 pods on CPU/memory
-│
-├── db/
-│   ├── pvc.yaml            # 20Gi Azure Managed Disk for PostgreSQL data
-│   ├── deployment.yaml     # PostgreSQL 16 — 1 replica (see note below)
-│   ├── service.yaml        # ClusterIP — internal only, port 5432
-│   └── hpa.yaml            # Locked to 1 replica (PostgreSQL cannot scale horizontally)
-│
-└── redis/
-    ├── deployment.yaml     # Redis 7 — 1 replica (see note below)
-    ├── service.yaml        # ClusterIP — internal only, port 6379
-    └── hpa.yaml            # Locked to 1 replica (standalone Redis cannot scale horizontally)
+└── overlays/
+    ├── qa/
+    │   ├── kustomization.yaml     # Patches: namespace=qa, 1 replica, small resources
+    │   └── values.yaml            # Human-readable QA profile (documentation)
+    ├── staging/
+    │   ├── kustomization.yaml     # Patches: namespace=staging, 2 replicas, medium resources
+    │   └── values.yaml            # Human-readable staging profile
+    └── production/
+        ├── kustomization.yaml     # Patches: namespace=production, 2 replicas, full resources
+        └── values.yaml            # Human-readable production profile
 ```
 
-**Note on db and redis:** For production workloads, replace these with managed Azure services:
-- Azure Database for PostgreSQL (Flexible Server) → delete `k8s/db/`, update `DATABASE_URL`
-- Azure Cache for Redis → delete `k8s/redis/`, update `REDIS_URL`
+**How Kustomize works here in one sentence:** each overlay's `kustomization.yaml` points to `../../base`, inherits all 17 resource files, and then patches only the fields that differ — replica counts, CPU/memory, HPA thresholds, and namespace name. Nothing is copied or duplicated.
+
+---
+
+## Environment profiles at a glance
+
+| Setting | QA | Staging | Production |
+|---|---|---|---|
+| Namespace | `qa` | `staging` | `production` |
+| Branch | `qa` | `staging` | `main` |
+| Replicas (backend/frontend) | 1 | 2 | 2 |
+| CPU request | 100m | 200m | 250m |
+| CPU limit | 200m | 400m | 500m |
+| Memory request | 128Mi | 200Mi | 256Mi |
+| Memory limit | 256Mi | 400Mi | 512Mi |
+| HPA min replicas | 1 | 2 | 2 |
+| HPA max replicas | 3 | 6 | 10 |
+| HPA CPU target | 70% | 65% | 60% |
+| HPA memory target | 80% | 75% | 70% |
+| Redis maxmemory | 200mb | 320mb | 400mb |
+| Image tag prefix | `qa-` | `staging-` | _(none)_ |
+
+**QA:** single pod, minimal resources, high HPA thresholds. Cost over stability.
+**Staging:** mirrors production pod count (2), medium resources. Validates rolling update behaviour.
+**Production:** full resources, aggressive HPA thresholds, tightest scale-up triggers.
+
+---
+
+## How to deploy to a specific environment
+
+Kustomize is built into `kubectl` — no extra tools needed.
+
+```bash
+# Deploy to QA
+kubectl apply -k k8s/overlays/qa
+
+# Deploy to staging
+kubectl apply -k k8s/overlays/staging
+
+# Deploy to production (prefer CI/CD — this is for emergencies)
+kubectl apply -k k8s/overlays/production
+```
+
+**Preview the final rendered manifests without applying them:**
+```bash
+kubectl kustomize k8s/overlays/qa
+kubectl kustomize k8s/overlays/staging
+kubectl kustomize k8s/overlays/production
+```
+Use this to verify your overlay patches look correct before touching a live cluster.
+
+---
+
+## How to check which environment you are looking at
+
+```bash
+# List pods in each environment
+kubectl get pods -n qa
+kubectl get pods -n staging
+kubectl get pods -n production
+
+# Confirm resource sizes and replica counts
+kubectl describe deployment backend -n qa
+kubectl describe deployment backend -n staging
+kubectl describe deployment backend -n production
+
+# Check HPA state and current targets
+kubectl get hpa -n qa
+kubectl get hpa -n staging
+kubectl get hpa -n production
+```
 
 ---
 
@@ -53,28 +130,29 @@ helm install ingress-nginx ingress-nginx/ingress-nginx \
   --namespace ingress-nginx --create-namespace
 ```
 
-**2. Metrics Server** (required for HPA to function)
+**2. Metrics Server** (required for HPA to report targets — shows "unknown" without it)
 ```bash
 kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
-# Verify:
-kubectl top nodes
+kubectl top nodes   # should return node CPU/memory after ~60 seconds
 ```
 
-**3. ACR pull secret** (required for pods to pull images from your ACR)
+**3. ACR pull secret** (one per namespace — repeat for each env)
 ```bash
-kubectl create secret docker-registry acr-secret \
-  --docker-server=<ACR_NAME>.azurecr.io \
-  --docker-username=<SERVICE_PRINCIPAL_CLIENT_ID> \
-  --docker-password=<SERVICE_PRINCIPAL_CLIENT_SECRET> \
-  -n production
+for NS in qa staging production; do
+  kubectl create secret docker-registry acr-secret \
+    --docker-server=<ACR_NAME>.azurecr.io \
+    --docker-username=<SP_CLIENT_ID> \
+    --docker-password=<SP_CLIENT_SECRET> \
+    -n $NS
+done
 ```
-Alternatively, assign the `AcrPull` role to the AKS kubelet managed identity — then remove `imagePullSecrets` from the deployments entirely (cleaner for AKS).
+Alternatively, assign the `AcrPull` role to the AKS kubelet managed identity — then remove `imagePullSecrets` from base deployment files entirely (preferred for AKS).
 
 ---
 
 ## How to replace secrets before first deploy
 
-`k8s/secrets.yaml` contains `<REPLACE_ME>` placeholders. **Never apply it with placeholders.**
+`k8s/base/secrets.yaml` contains `<REPLACE_ME>` placeholders. Never apply it with placeholders.
 
 **Step 1: Generate your values**
 ```bash
@@ -83,173 +161,155 @@ python -c "from django.core.management.utils import get_random_secret_key; print
 
 # PostgreSQL password
 openssl rand -base64 32
-
-# Build your DATABASE_URL
-# Format: postgres://<user>:<password>@db:5432/<dbname>
-# Example: postgres://postgres:s3cr3tpassword@db:5432/myapp_prod
 ```
 
-**Step 2: Base64-encode each value**
+**Step 2: Base64-encode each value** (use `-n` to avoid encoding a trailing newline)
 ```bash
 echo -n "your-actual-value" | base64
-# Use -n to avoid encoding a trailing newline — it will break the connection string.
 ```
 
-**Step 3: Replace placeholders in secrets.yaml**
-Open `k8s/secrets.yaml` and replace each `<REPLACE_ME>` with the base64-encoded value.
+**Step 3: Replace each `<REPLACE_ME>` in secrets.yaml**
 
-**Step 4: Apply the secret (do not commit the file with real values)**
+**Step 4: Apply, then restore the placeholder version immediately**
 ```bash
-kubectl apply -f k8s/secrets.yaml
+kubectl apply -f k8s/base/secrets.yaml -n qa
+kubectl apply -f k8s/base/secrets.yaml -n staging
+kubectl apply -f k8s/base/secrets.yaml -n production
+git checkout k8s/base/secrets.yaml   # Do not commit real values
 ```
 
-**Step 5: Immediately delete the file from your local disk or restore the placeholder version**
-```bash
-git checkout k8s/secrets.yaml  # Restore the placeholder version
-```
-
-For production, manage secrets via Azure Key Vault + Secrets Store CSI Driver instead of this file.
-See: https://learn.microsoft.com/en-us/azure/aks/csi-secrets-store-driver
+For production-grade secret management, use Azure Key Vault with the Secrets Store CSI Driver:
+https://learn.microsoft.com/en-us/azure/aks/csi-secrets-store-driver
 
 ---
 
-## How to apply everything (first deploy)
-
-Apply in this order to satisfy dependencies:
+## How to apply everything for the first time
 
 ```bash
-# 1. Namespace first — everything else lives inside it
-kubectl apply -f k8s/namespace.yaml
+# 1. Apply the overlay — this creates the namespace and all resources in one shot.
+#    Kustomize handles ordering; namespace is created before namespace-scoped resources.
+kubectl apply -k k8s/overlays/qa
+kubectl apply -k k8s/overlays/staging
+kubectl apply -k k8s/overlays/production
 
-# 2. Shared config and secrets
-kubectl apply -f k8s/configmap.yaml
-kubectl apply -f k8s/secrets.yaml     # Ensure <REPLACE_ME> is replaced first
+# 2. Apply secrets (after replacing placeholders — see above)
+#    The overlay applies the base secrets.yaml into the correct namespace,
+#    but you still need to fill in the real values per namespace.
+kubectl create secret generic app-secrets \
+  --from-literal=DJANGO_SECRET_KEY="<real-value>" \
+  --from-literal=DATABASE_URL="<real-value>" \
+  --from-literal=REDIS_URL="<real-value>" \
+  --from-literal=POSTGRES_USER="<real-value>" \
+  --from-literal=POSTGRES_PASSWORD="<real-value>" \
+  --from-literal=POSTGRES_DB="<real-value>" \
+  -n production --dry-run=client -o yaml | kubectl apply -f -
+# Repeat for -n staging and -n qa with their own values.
 
-# 3. Storage (must exist before the db Deployment mounts it)
-kubectl apply -f k8s/db/pvc.yaml
-
-# 4. All remaining manifests
-kubectl apply -f k8s/ --recursive
-
-# 5. Verify everything is running
+# 3. Verify everything is running
+kubectl get all -n qa
+kubectl get all -n staging
 kubectl get all -n production
 ```
-
-**After the first deploy, the CI/CD pipeline handles all subsequent deploys automatically.**
 
 ---
 
 ## Required GitHub secrets
 
-Go to: GitHub repository → Settings → Secrets and variables → Actions → New repository secret
+Go to: GitHub → Settings → Secrets and variables → Actions → New repository secret
 
-| Secret name | Where to find it | Example |
-|---|---|---|
-| `AZURE_CLIENT_ID` | Azure AD → App registrations → your app → Application (client) ID | `a1b2c3d4-...` |
-| `AZURE_TENANT_ID` | Azure AD → Overview → Directory (tenant) ID | `e5f6g7h8-...` |
-| `AZURE_SUBSCRIPTION_ID` | Azure portal → Subscriptions | `i9j0k1l2-...` |
-| `ACR_NAME` | Azure Container Registry → name (without .azurecr.io) | `myappregistry` |
-| `AKS_CLUSTER_NAME` | AKS → your cluster name | `myapp-aks-prod` |
-| `AKS_RESOURCE_GROUP` | AKS → resource group name | `myapp-rg-prod` |
+| Secret | Where to find it |
+|---|---|
+| `AZURE_CLIENT_ID` | Azure AD → App registrations → your app → Application (client) ID |
+| `AZURE_TENANT_ID` | Azure AD → Overview → Directory (tenant) ID |
+| `AZURE_SUBSCRIPTION_ID` | Azure portal → Subscriptions |
+| `ACR_NAME` | ACR registry name without `.azurecr.io` (e.g. `myapp`) |
+| `AKS_CLUSTER_NAME` | AKS cluster name |
+| `AKS_RESOURCE_GROUP` | Resource group containing the AKS cluster |
 
-**OIDC federated credential setup** (required for `azure/login@v2` to work):
-
-1. Go to Azure AD → App registrations → your app → Certificates & secrets → Federated credentials
-2. Add a credential:
-   - Federated credential scenario: GitHub Actions deploying Azure resources
-   - Organization: your GitHub org or username
-   - Repository: your repository name
-   - Entity: Branch
-   - Branch: main
-3. Grant the app the following roles:
-   - `AcrPush` on your Azure Container Registry
-   - `Azure Kubernetes Service Cluster User Role` on your AKS cluster
-   - `Azure Kubernetes Service RBAC Writer` on the `production` namespace (or cluster-level `Contributor` for simplicity)
+**OIDC federated credential setup** — required for `azure/login@v2`:
+1. Azure AD → App registrations → your app → Certificates & secrets → Federated credentials
+2. Add one credential per branch (main, staging, qa), selecting Entity: Branch
+3. Grant the app: `AcrPush` on ACR, `Azure Kubernetes Service Cluster User Role` + `RBAC Writer` on AKS
 
 ---
 
-## How to debug
+## Debugging
 
-### Check pod status
+### Pod status and events
 ```bash
 # List all pods and their status
 kubectl get pods -n production
 
-# Watch pod status in real time
+# Watch pods in real time (Ctrl+C to stop)
 kubectl get pods -n production -w
 
-# Show events (useful for "Pending" or "CrashLoopBackOff" pods)
+# Show events for a failing pod (catches ImagePullBackOff, OOMKilled, etc.)
 kubectl describe pod <pod-name> -n production
+
+# Show all recent events in a namespace
+kubectl get events -n production --sort-by='.lastTimestamp' | tail -30
 ```
 
-### Read logs
+### Logs
 ```bash
-# Logs from a specific pod
-kubectl logs <pod-name> -n production
-
-# Logs from all pods of a deployment (most useful)
+# Logs from all pods of a deployment
 kubectl logs -l app=backend -n production --tail=100
 
 # Follow logs in real time
 kubectl logs -l app=backend -n production -f
 
-# Previous container logs (useful after a crash/restart)
+# Logs from the previous container after a crash
 kubectl logs <pod-name> -n production --previous
 ```
 
-### Inspect a failing deployment
+### Deployment health
 ```bash
-# Check rollout status (shows if pods are progressing or stuck)
+# Check rollout progress
 kubectl rollout status deployment/backend -n production
 
-# Describe the deployment (shows replica counts, conditions, events)
+# Describe deployment (shows replica counts, conditions, and events)
 kubectl describe deployment backend -n production
 
-# Check recent events in the namespace (catches image pull errors, OOMKills, etc.)
-kubectl get events -n production --sort-by='.lastTimestamp' | tail -30
+# Verify Kustomize overlay before applying
+kubectl kustomize k8s/overlays/production
 ```
 
-### Check HPA status
+### HPA status
 ```bash
-# Show current vs target metrics and replica counts
+# Shows TARGETS (current/desired), MINPODS, MAXPODS, REPLICAS
 kubectl get hpa -n production
 
-# Detailed HPA info including scaling events and conditions
+# Full details including scaling events and conditions
 kubectl describe hpa backend-hpa -n production
-
-# "unknown" in TARGETS means Metrics Server is not running — see Prerequisites above
+# "unknown" in TARGETS → Metrics Server not installed or pods have no resource requests
 ```
 
 ### Roll back a bad deploy
 ```bash
-# Option 1: Roll back to the previous Deployment revision
+# Option 1: Roll back to the previous Deployment revision (fastest)
 kubectl rollout undo deployment/backend -n production
 kubectl rollout undo deployment/frontend -n production
 
-# Option 2: Roll back to a specific git SHA (preferred — precise)
+# Option 2: Roll back to a specific git SHA (more precise)
 kubectl set image deployment/backend \
   backend=<ACR_NAME>.azurecr.io/backend:<PREVIOUS_SHA> \
   -n production
 
-# Verify rollback
+# Confirm rollback
 kubectl rollout status deployment/backend -n production
 ```
 
-### Get a shell inside a running pod
+### Shell into a running pod
 ```bash
-# Open a shell in a backend pod (useful for running manage.py commands)
+# Open an interactive shell
 kubectl exec -it <pod-name> -n production -- /bin/sh
 
-# Run a one-off management command without opening a shell
-kubectl exec -it <pod-name> -n production -- python manage.py shell
+# Run a one-off Django management command
 kubectl exec -it <pod-name> -n production -- python manage.py migrate --plan
 ```
 
-### Check resource usage
+### Resource usage
 ```bash
-# CPU and memory per pod (requires Metrics Server)
-kubectl top pods -n production
-
-# CPU and memory per node
-kubectl top nodes
+kubectl top pods -n production   # CPU + memory per pod (needs Metrics Server)
+kubectl top nodes                # CPU + memory per node
 ```
