@@ -1,0 +1,70 @@
+# docker-compose.yml — BASE (dev)
+version: '3.9'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      target: development          # targets the dev stage
+    volumes:
+      - ./backend:/app             # bind mount for hot reload
+      - /app/__pycache__           # exclude pycache from mount
+    env_file:
+      - .env.dev
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  frontend:
+    build:
+      context: ./frontend
+      target: development          # Vite dev server with HMR
+    volumes:
+      - ./frontend:/app            # bind mount for hot reload
+      - /app/node_modules          # anonymous volume — don't overwrite node_modules
+    env_file:
+      - .env.dev
+    ports:
+      - "5173:5173"
+    networks:
+      - app-network
+
+  db:
+    image: postgres:16-alpine
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: myapp_dev
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - app-network
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app-network
+
+volumes:
+  pgdata:
+
+networks:
+  app-network:
+    driver: bridge

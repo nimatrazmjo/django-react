@@ -1,0 +1,36 @@
+# docker-compose.staging.yml — OVERRIDES for staging
+version: '3.9'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      target: staging              # targets staging stage
+    volumes: []                    # no bind mounts in staging
+    env_file:
+      - .env.staging
+    ports: []                      # no direct port exposure — goes through nginx
+
+  frontend:
+    build:
+      context: ./frontend
+      target: staging
+      args:
+        VITE_API_URL: https://staging.myapp.com
+        VITE_ENV: staging
+    volumes: []
+    env_file:
+      - .env.staging
+    ports: []
+
+  nginx:
+    image: nginx:1.25-alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - app-network
