@@ -1,0 +1,69 @@
+# frontend/hpa.yaml — Horizontal Pod Autoscaler for the React frontend (nginx).
+#
+# What this file does:
+#   Automatically scales the number of frontend pods up or down based on CPU
+#   and memory usage. nginx serving static files is very lightweight, so in
+#   practice this HPA will rarely fire — but it is here for traffic spikes
+#   (e.g. a viral post that sends a sudden surge of users).
+#
+# How the HPA control loop works:
+#   1. Every 15 seconds, the HPA queries the Metrics Server.
+#   2. desiredReplicas = ceil(currentReplicas × (actualMetric / targetMetric))
+#   3. When multiple metrics are configured, the HPA takes the MAXIMUM result.
+#   4. Scale-up is immediate. Scale-down waits 5 minutes to avoid thrashing.
+#
+# How to apply:
+#   kubectl apply -f k8s/frontend/hpa.yaml
+#
+# How to verify:
+#   kubectl get hpa frontend-hpa -n production
+#   kubectl describe hpa frontend-hpa -n production
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: frontend-hpa
+  namespace: production
+
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: frontend     # Must match Deployment name in deployment.yaml.
+
+  minReplicas: 2       # Never drop below 2 pods even at zero traffic.
+                       # nginx is stateless so 2 is sufficient for HA —
+                       # if one pod's node is drained for maintenance, the
+                       # other keeps serving with no visible downtime.
+
+  maxReplicas: 10      # Hard ceiling for this service.
+                       # nginx serving static files can handle hundreds of
+                       # requests per second per pod, so 10 pods is enough
+                       # for significant traffic. Adjust based on your load profile.
+
+  metrics:
+    # ── CPU scaling ────────────────────────────────────────────────────────────
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60  # Scale when average CPU across frontend pods exceeds
+                                  # 60% of their CPU request (250m × 60% = 150m per pod).
+                                  # nginx doing static file serving rarely exceeds 10-20%
+                                  # CPU — if you see consistent scaling here, investigate
+                                  # whether something is causing unexpected CPU load
+                                  # (e.g. nginx doing heavy SSL termination or compression).
+
+    # ── Memory scaling ─────────────────────────────────────────────────────────
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70  # Scale when average memory across pods exceeds 70% of
+                                  # their memory request (256Mi × 70% ≈ 179Mi per pod).
+                                  # nginx static serving uses ~20-50MB typically.
+                                  # If memory is consistently high, check for nginx
+                                  # worker_processes or large open_file_cache settings.
+                                  # Memory does not compress — scale before OOMKill hits.

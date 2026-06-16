@@ -1,0 +1,181 @@
+# backend/deployment.yaml — Runs the Django REST API (gunicorn) in Kubernetes.
+#
+# What this file does:
+#   A Deployment manages a set of identical pods running the Django backend.
+#   Kubernetes keeps the desired number of replicas running at all times,
+#   replacing crashed pods automatically and rolling out new versions without
+#   downtime.
+#
+# The production stage of backend/Dockerfile is used here:
+#   - Runs gunicorn (not the Django dev server)
+#   - Runs as a non-root user
+#   - entrypoint.sh waits for the DB and runs migrations before starting gunicorn
+#
+# How to apply:
+#   kubectl apply -f k8s/backend/deployment.yaml
+#
+# How to verify:
+#   kubectl get deployment backend -n production
+#   kubectl rollout status deployment/backend -n production
+#   kubectl describe deployment backend -n production
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: production
+  labels:
+    app: backend  # Used by the Service selector to find these pods.
+                  # Change both here and in service.yaml if you rename.
+
+spec:
+  # ── Replica count ─────────────────────────────────────────────────────────────
+  replicas: 2  # Run 2 pods at all times.
+               # During a rolling update Kubernetes keeps at least 1 pod serving
+               # while the other is replaced, giving zero-downtime deploys.
+               # The HPA (hpa.yaml) will adjust this count up/down based on load.
+               # This value becomes the HPA's minimum floor.
+
+  selector:
+    matchLabels:
+      app: backend  # Must match the labels on the pod template below.
+
+  strategy:
+    type: RollingUpdate  # Replace pods one at a time, not all at once.
+    rollingUpdate:
+      maxSurge: 1        # Allow 1 extra pod above the desired count during updates.
+                         # So during a deploy: up to 3 pods can exist briefly.
+                         # Increase if you want faster rollouts at the cost of extra nodes.
+      maxUnavailable: 0  # Never let the available pod count drop below the desired count.
+                         # This guarantees zero-downtime: the old pod stays up until the
+                         # new one passes its readiness probe. Safe but slightly slower.
+
+  template:
+    metadata:
+      labels:
+        app: backend  # Must match spec.selector.matchLabels above.
+
+    spec:
+      # ── Image pull credentials ───────────────────────────────────────────────
+      # Required to pull from Azure Container Registry (ACR).
+      # Create this secret once per cluster:
+      #   kubectl create secret docker-registry acr-secret \
+      #     --docker-server=<ACR_NAME>.azurecr.io \
+      #     --docker-username=<SP_CLIENT_ID> \
+      #     --docker-password=<SP_CLIENT_SECRET> \
+      #     -n production
+      # Alternatively, attach the AcrPull role to the AKS kubelet identity
+      # and remove imagePullSecrets entirely (preferred for AKS).
+      imagePullSecrets:
+        - name: acr-secret  # Must match the secret name created above.
+
+      containers:
+        - name: backend
+          image: <ACR_NAME>.azurecr.io/backend:latest
+          # Replace <ACR_NAME> with your actual ACR registry name.
+          # The CI/CD pipeline (deploy.yaml) overwrites :latest with the git SHA tag
+          # on every deploy so you can trace exactly which commit is running.
+
+          imagePullPolicy: Always  # Always pull from ACR on pod start.
+                                   # This ensures :latest in the registry is always used,
+                                   # even if the local node cache has an older version.
+                                   # Safe because we tag with git SHA in CI — if the pull
+                                   # fails, the old pods keep running.
+
+          ports:
+            - containerPort: 8000  # Gunicorn binds to 0.0.0.0:8000 inside the container.
+                                   # This is informational only — it does not publish the port.
+                                   # The Service (service.yaml) controls external reachability.
+
+          # ── Environment variables ──────────────────────────────────────────────
+          # Non-sensitive vars come from ConfigMap; secrets come from Secret.
+          # Never hardcode passwords or secret keys directly in this file.
+          envFrom:
+            - configMapRef:
+                name: app-config   # Injects all keys from configmap.yaml as env vars.
+            - secretRef:
+                name: app-secrets  # Injects all keys from secrets.yaml as env vars.
+                                   # The pod will fail to start (ImagePullBackOff or
+                                   # CreateContainerConfigError) if this Secret is missing.
+
+          # ── Resource guarantees and limits ────────────────────────────────────
+          resources:
+            requests:
+              cpu: "250m"     # 0.25 of 1 CPU core. The Kubernetes scheduler places this pod
+                              # on a node that has at least 250m CPU available.
+                              # Too low: pod gets placed on a saturated node and throttles constantly.
+                              # Too high: wastes node capacity; fewer pods fit per node.
+              memory: "256Mi" # 256MB guaranteed RAM. The node reserves this regardless of actual usage.
+                              # Gunicorn with 4 workers typically uses 150-300MB depending on request volume.
+                              # Increase if you see OOMKilled in kubectl describe pod output.
+            limits:
+              cpu: "500m"     # Hard cap at 0.5 CPU core. If gunicorn bursts above this,
+                              # Kubernetes throttles it (CPU is compressible — it slows down, not killed).
+                              # Set to 2× the request as a safe burst allowance.
+                              # Increase if you see high CPU throttle metrics in Azure Monitor.
+              memory: "512Mi" # Hard cap at 512MB. If exceeded, the container is OOMKilled and restarted.
+                              # Watch for OOMKilled in: kubectl describe pod <pod-name> -n production
+                              # Increase if you see repeated OOMKilled events.
+
+          # ── Readiness probe ───────────────────────────────────────────────────
+          # What readiness does:
+          #   When a pod fails its readiness probe, Kubernetes removes it from the
+          #   Service's list of healthy endpoints. Traffic stops going to that pod.
+          #   The pod is NOT restarted — it stays alive and keeps being probed.
+          #   Once it passes again, it re-enters the endpoint list automatically.
+          #
+          # Why this matters during rolling deployments:
+          #   A new pod is not allowed to receive traffic until it passes readiness.
+          #   This means migrations must complete and gunicorn must be fully up
+          #   before any user request is routed to the new pod. Without this,
+          #   users could hit a pod that is still running migrations and get 500 errors.
+          readinessProbe:
+            httpGet:
+              path: /api/health/  # Django health check endpoint (defined in urls.py).
+                                  # Returns HTTP 200 when the app is up and DB is reachable.
+                                  # If you change the health check URL, update this too.
+              port: 8000          # Must match containerPort above.
+            initialDelaySeconds: 20  # Wait 20s after container starts before first probe.
+                                     # entrypoint.sh waits for DB + runs migrations before
+                                     # gunicorn starts. 20s is usually enough; if migrations
+                                     # are slow on first deploy, increase this.
+            periodSeconds: 10        # Check every 10 seconds. Lower = faster recovery detection.
+                                     # Higher = less probe traffic. 10s is a good default.
+            failureThreshold: 3      # Remove from Service after 3 consecutive failures.
+                                     # So a pod needs to fail for 30 seconds before being
+                                     # taken out of rotation. Prevents flapping on transient blips.
+            timeoutSeconds: 5        # Each probe HTTP request must respond within 5 seconds.
+                                     # If gunicorn is backlogged under load, slow responses
+                                     # here may mark healthy pods as not ready. Set conservatively.
+
+          # ── Liveness probe ────────────────────────────────────────────────────
+          # What liveness does:
+          #   When a pod fails its liveness probe, Kubernetes kills the container
+          #   and restarts it (subject to the pod's restartPolicy, which defaults
+          #   to Always). Unlike readiness, a liveness failure is a hard restart.
+          #
+          # Use liveness for true stuck/deadlock detection, not for warm-up.
+          # If you set liveness too aggressively, you create a restart loop on startup.
+          livenessProbe:
+            httpGet:
+              path: /api/health/  # Same endpoint as readiness. A 200 means gunicorn
+                                  # is alive and can process requests.
+              port: 8000
+            initialDelaySeconds: 30  # Wait 30s before the FIRST liveness check.
+                                     # This gives entrypoint.sh time to run migrations
+                                     # and gunicorn time to fully initialise.
+                                     # If liveness starts too early and the app is still
+                                     # starting, Kubernetes kills it before it ever starts —
+                                     # creating an unrecoverable restart loop on cold deploy.
+                                     # Increase if your migrations take longer than 30s.
+            periodSeconds: 15        # Check every 15 seconds.
+                                     # Lower than readiness because we want to detect truly
+                                     # stuck pods, but don't need to react as fast.
+            timeoutSeconds: 3        # Danger: setting this too low causes false positives.
+                                     # Under heavy load, gunicorn may take 2-3s to respond.
+                                     # A timeout of 1s would kill a busy-but-healthy pod.
+                                     # 3s is a safe floor; increase if you see unexpected restarts
+                                     # under load (check: kubectl describe pod -n production).
+            failureThreshold: 3      # Restart the container after 3 consecutive failures.
+                                     # So a pod must be unresponsive for 45s (3 × 15s)
+                                     # before it is killed. Prevents restarts on single slow checks.

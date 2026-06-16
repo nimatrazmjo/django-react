@@ -1,0 +1,42 @@
+# db/service.yaml — Internal ClusterIP Service for PostgreSQL.
+#
+# What this file does:
+#   Gives the postgres pod a stable DNS name inside the cluster.
+#   The backend connects to PostgreSQL using the DATABASE_URL secret, which
+#   should reference "db" as the hostname (e.g. postgres://user:pass@db:5432/myapp_prod).
+#   Without this Service, the backend would need to know the pod's IP directly,
+#   which changes every time the pod is rescheduled.
+#
+#   This Service is type: ClusterIP — internal only.
+#   PostgreSQL must NEVER be exposed directly to the internet.
+#   Port 5432 is a well-known attack target for credential brute-force.
+#
+# How to apply:
+#   kubectl apply -f k8s/db/service.yaml
+#
+# How to verify:
+#   kubectl get service db -n production
+#   kubectl describe service db -n production
+#   # From the backend pod, test connectivity:
+#   #   kubectl exec -it <backend-pod> -n production -- python -c \
+#   #     "import psycopg2; psycopg2.connect('...'); print('ok')"
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: db           # DNS hostname: http://db:5432 (within the production namespace).
+                     # Must match the hostname in DATABASE_URL secret.
+                     # If you rename this, update the DATABASE_URL secret value too.
+  namespace: production
+
+spec:
+  type: ClusterIP    # Internal only. PostgreSQL must never be publicly accessible.
+
+  selector:
+    app: db          # Routes to pods with label app: db (the postgres Deployment).
+
+  ports:
+    - name: postgres
+      port: 5432         # Standard PostgreSQL port. Used in the DATABASE_URL connection string.
+      targetPort: 5432   # Port PostgreSQL listens on inside the container.
+      protocol: TCP

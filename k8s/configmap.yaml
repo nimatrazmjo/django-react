@@ -1,0 +1,58 @@
+# configmap.yaml — Non-sensitive environment variables shared across services.
+#
+# What this file does:
+#   A ConfigMap stores plain-text key/value pairs that pods read as environment
+#   variables. Values here are visible to anyone who can run kubectl get configmap.
+#
+# ⚠️  IMPORTANT — ConfigMaps are NOT encrypted.
+#   Never put passwords, secret keys, tokens, or connection strings with
+#   credentials here. Those belong in secrets.yaml. This file is safe to
+#   commit to version control because it contains no secrets.
+#
+# How to apply:
+#   kubectl apply -f k8s/configmap.yaml
+#
+# How to verify:
+#   kubectl get configmap app-config -n production
+#   kubectl describe configmap app-config -n production
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config     # Referenced by name in each deployment's envFrom or env block.
+                       # Rename here AND in every deployment.yaml if you change this.
+  namespace: production
+
+data:
+  # ── Django settings ──────────────────────────────────────────────────────────
+
+  DJANGO_SETTINGS_MODULE: "config.settings.prod"
+  # Tells Django which settings file to load on startup.
+  # The prod settings file disables DEBUG, enforces ALLOWED_HOSTS, and loads
+  # production-grade cache/DB backends. Never point this at .dev in production.
+
+  DEBUG: "False"
+  # Django debug mode. When True, Django renders detailed error pages with full
+  # stack traces — a security risk in production. Must be False in prod.
+  # Also affects whether Django serves static files (it doesn't in prod — nginx does).
+
+  ALLOWED_HOSTS: "myapp.com,www.myapp.com"
+  # Comma-separated list of hostnames Django will respond to.
+  # Requests with a Host header not in this list are rejected with HTTP 400.
+  # Update this to match your actual domain. Include the AKS ingress IP or
+  # hostname here if you want to test before DNS is pointed.
+
+  CORS_ALLOWED_ORIGINS: "https://myapp.com"
+  # Origins allowed to make cross-origin requests to the Django API.
+  # Must match the exact protocol + domain + port the frontend is served from.
+  # If you add a staging subdomain, add it here too.
+  # Mismatch causes browser-side CORS errors — check the Network tab in DevTools.
+
+  # ── Frontend build / runtime ─────────────────────────────────────────────────
+
+  VITE_ENV: "production"
+  # Tells the frontend which environment it is running in.
+  # Used by the app for conditional logic (e.g. feature flags, logging level).
+  # Note: VITE_API_URL is intentionally omitted here because in production
+  # the frontend nginx proxies /api/ to the backend ClusterIP service directly
+  # (see nginx.conf proxy_pass). No public API URL is needed at runtime.

@@ -1,0 +1,53 @@
+# backend/service.yaml — Internal ClusterIP Service for the Django backend.
+#
+# What this file does:
+#   A Service gives the backend Deployment a stable DNS name and IP address
+#   inside the cluster. Without a Service, pods have individual IPs that change
+#   every time a pod restarts or is rescheduled.
+#
+#   This Service is type: ClusterIP, which means:
+#   - It is ONLY reachable from inside the Kubernetes cluster.
+#   - It is NOT exposed to the internet.
+#   - Other pods in the "production" namespace reach it as: http://backend:8000
+#   - Pods in other namespaces reach it as: http://backend.production.svc.cluster.local:8000
+#
+#   Public traffic reaches the backend through the Ingress (ingress.yaml),
+#   which routes /api/* requests to this Service. The Ingress is the only
+#   component that needs a public IP.
+#
+# How to apply:
+#   kubectl apply -f k8s/backend/service.yaml
+#
+# How to verify:
+#   kubectl get service backend -n production
+#   kubectl describe service backend -n production
+#   # Check "Endpoints" in describe output — it lists healthy pod IPs.
+#   # If Endpoints is empty, the selector labels don't match any running pods.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend      # This name becomes the DNS hostname for in-cluster access.
+                     # Other services (e.g. frontend nginx proxy_pass) use this name.
+                     # Rename here AND update any nginx configs or env vars that reference it.
+  namespace: production
+
+spec:
+  type: ClusterIP    # Internal only. Not reachable from outside the cluster.
+                     # Use this for every service that does not need a public IP.
+                     # The Ingress controller (ingress.yaml) is the single public entry point.
+
+  selector:
+    app: backend     # Routes traffic only to pods with this label.
+                     # Must match the labels in backend/deployment.yaml pod template.
+                     # Kubernetes continuously watches for matching pods and updates
+                     # the endpoint list as pods are added, removed, or become unhealthy.
+
+  ports:
+    - name: http
+      port: 8000         # The port that other services (Ingress, frontend) connect to.
+                         # Example: http://backend:8000/api/health/
+      targetPort: 8000   # The port that gunicorn listens on inside the container.
+                         # Must match containerPort in deployment.yaml.
+                         # If you change gunicorn's bind port, update targetPort here.
+      protocol: TCP

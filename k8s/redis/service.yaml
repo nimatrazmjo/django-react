@@ -1,0 +1,42 @@
+# redis/service.yaml — Internal ClusterIP Service for Redis.
+#
+# What this file does:
+#   Gives the Redis pod a stable DNS name so the backend can connect to it
+#   via the REDIS_URL secret (e.g. redis://redis:6379/0).
+#   Without this Service, the backend would need the pod's IP, which changes
+#   on every pod restart or reschedule.
+#
+#   This Service is type: ClusterIP — internal only.
+#   Redis must NEVER be exposed publicly. In this configuration there is no
+#   authentication (requirepass is not set), so public exposure would allow
+#   anyone to read and write your cache and session data.
+#
+# How to apply:
+#   kubectl apply -f k8s/redis/service.yaml
+#
+# How to verify:
+#   kubectl get service redis -n production
+#   kubectl describe service redis -n production
+#   # From the backend pod, test:
+#   #   kubectl exec -it <backend-pod> -n production -- python -c \
+#   #     "import redis; r = redis.from_url('redis://redis:6379/0'); print(r.ping())"
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis        # DNS hostname: redis:6379 (within the production namespace).
+                     # Must match the hostname in REDIS_URL secret.
+                     # If you rename this, update the REDIS_URL secret value too.
+  namespace: production
+
+spec:
+  type: ClusterIP    # Internal only. Redis must never be exposed to the internet.
+
+  selector:
+    app: redis       # Routes to pods with label app: redis.
+
+  ports:
+    - name: redis
+      port: 6379         # Standard Redis port. Used in the REDIS_URL connection string.
+      targetPort: 6379   # Port Redis listens on inside the container.
+      protocol: TCP

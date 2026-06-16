@@ -1,0 +1,56 @@
+# db/pvc.yaml — PersistentVolumeClaim for PostgreSQL data storage.
+#
+# What this file does:
+#   A PersistentVolumeClaim (PVC) requests a durable storage volume from
+#   the cluster. In AKS, this provisions an Azure Managed Disk automatically.
+#   The disk persists independently of the pod — if the postgres pod is deleted
+#   or rescheduled to another node, it reattaches to the same disk and data
+#   is not lost.
+#
+# ⚠️  PRODUCTION RECOMMENDATION:
+#   Running PostgreSQL inside Kubernetes on a single pod is suitable for
+#   development or low-traffic workloads. For production, strongly consider:
+#     Azure Database for PostgreSQL (Flexible Server)
+#     https://learn.microsoft.com/en-us/azure/postgresql/flexible-server/overview
+#   Benefits: automated backups, point-in-time restore, high availability,
+#   managed patching, no disk management needed.
+#   If you use Azure Database for PostgreSQL, delete this file and the db/
+#   Deployment entirely — just update the DATABASE_URL secret to point at it.
+#
+# How to apply:
+#   kubectl apply -f k8s/db/pvc.yaml
+#
+# How to verify:
+#   kubectl get pvc postgres-data -n production
+#   # STATUS should be "Bound" — if it stays "Pending", the storage class
+#   # may not exist. Check: kubectl get storageclass
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data   # Referenced by the db Deployment as a volume.
+                        # Rename here AND in db/deployment.yaml if you change this.
+  namespace: production
+
+spec:
+  accessModes:
+    - ReadWriteOnce     # The disk can be mounted by ONE node at a time.
+                        # This is correct for a single-replica PostgreSQL pod.
+                        # Do NOT use ReadWriteMany for PostgreSQL — it is not safe
+                        # for multiple writers on a shared block device.
+
+  storageClassName: managed-premium  # AKS storage class that provisions an Azure Premium SSD.
+                                     # Premium SSD is recommended for databases: lower latency,
+                                     # higher IOPS than Standard SSD or HDD.
+                                     # Available classes in AKS: managed-premium, managed, azurefile
+                                     # Check available classes: kubectl get storageclass
+                                     # For lower cost dev/staging: use "managed" (Standard SSD).
+
+  resources:
+    requests:
+      storage: 20Gi     # 20 gigabytes of disk space for PostgreSQL data files.
+                        # The actual size depends on your data volume.
+                        # PostgreSQL data grows gradually — monitor with:
+                        #   kubectl exec -it <db-pod> -n production -- df -h /var/lib/postgresql/data
+                        # Azure PVCs can be expanded online (resize PVC, restart pod).
+                        # Increase before you run out — expanding is easy, shrinking is not.

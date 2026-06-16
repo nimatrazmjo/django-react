@@ -1,0 +1,27 @@
+# namespace.yaml — Creates the "production" Kubernetes namespace.
+#
+# What this file does:
+#   A Namespace is a logical partition inside a single Kubernetes cluster.
+#   All resources in this project (Deployments, Services, Secrets, etc.)
+#   live inside the "production" namespace, isolated from anything else
+#   running on the same cluster (e.g. staging, monitoring, or other teams).
+#
+#   Isolation benefits:
+#   - RBAC policies can be scoped to this namespace only
+#   - Resource quotas can be applied per namespace
+#   - kubectl commands can be scoped with -n production to avoid accidents
+#   - Deleting this namespace tears down every resource inside it cleanly
+#
+# How to apply:
+#   kubectl apply -f k8s/namespace.yaml
+#
+# How to verify:
+#   kubectl get namespaces
+#   # You should see "production" in the list with STATUS Active
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production  # Every other manifest in this project sets
+                    # namespace: production to land here.
+                    # If you rename this, update every other file too.

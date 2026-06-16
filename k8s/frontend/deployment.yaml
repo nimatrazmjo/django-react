@@ -1,0 +1,139 @@
+# frontend/deployment.yaml — Runs the React SPA served by nginx in Kubernetes.
+#
+# What this file does:
+#   Deploys the production stage of frontend/Dockerfile: a lightweight nginx
+#   container that serves pre-built React static files and proxies /api/ to
+#   the backend ClusterIP Service.
+#
+#   Unlike the backend, this container has no startup work (no migrations,
+#   no DB connections) — nginx starts instantly once the image is pulled.
+#
+# How to apply:
+#   kubectl apply -f k8s/frontend/deployment.yaml
+#
+# How to verify:
+#   kubectl get deployment frontend -n production
+#   kubectl rollout status deployment/frontend -n production
+#   kubectl describe deployment frontend -n production
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: production
+  labels:
+    app: frontend
+
+spec:
+  # ── Replica count ─────────────────────────────────────────────────────────────
+  replicas: 2  # 2 pods for redundancy and zero-downtime rolling updates.
+               # nginx is stateless and starts in under 1 second, so 2 replicas
+               # is sufficient even at high traffic — the HPA handles burst scaling.
+
+  selector:
+    matchLabels:
+      app: frontend
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1        # Allow 1 extra pod during updates. nginx starts in ~1s
+                         # so the surge pod is ready almost immediately.
+      maxUnavailable: 0  # Never reduce below desired replica count during updates.
+                         # Guarantees continuous availability through deploys.
+
+  template:
+    metadata:
+      labels:
+        app: frontend
+
+    spec:
+      imagePullSecrets:
+        - name: acr-secret  # Same ACR pull secret used by all custom service images.
+                             # See backend/deployment.yaml for creation instructions.
+
+      containers:
+        - name: frontend
+          image: <ACR_NAME>.azurecr.io/frontend:latest
+          # Replace <ACR_NAME> with your actual ACR registry name.
+          # Built from frontend/Dockerfile using the "production" stage:
+          # - Builder stage compiles React with Vite
+          # - Production stage serves /app/dist with nginx on port 80
+          # VITE_API_URL and VITE_ENV are baked in at build time (not runtime),
+          # so they do not appear in the env block below — they are injected
+          # as Docker build args in the CI/CD pipeline (deploy.yaml).
+
+          imagePullPolicy: Always  # Always pull from ACR. Ensures the latest image
+                                   # is used even if the node has a cached copy.
+
+          ports:
+            - containerPort: 80  # nginx listens on port 80 inside the container.
+                                 # Defined in frontend/nginx/nginx.conf.
+
+          # ── Environment variables ──────────────────────────────────────────────
+          # The frontend nginx container needs minimal runtime config.
+          # VITE_* vars are baked into the static JS bundle at build time.
+          # Only inject vars that nginx itself needs at runtime.
+          env:
+            - name: VITE_ENV        # Available to the nginx process for any
+              valueFrom:            # templating or server-side logic if needed.
+                configMapKeyRef:    # Using a targeted reference rather than envFrom
+                  name: app-config  # to avoid injecting Django-specific vars into
+                  key: VITE_ENV     # the nginx container where they have no meaning.
+
+          # ── Resource guarantees and limits ────────────────────────────────────
+          resources:
+            requests:
+              cpu: "250m"     # nginx is extremely lightweight. In practice it uses
+                              # far less than 250m, but we set this so the scheduler
+                              # places it on a node with headroom. Reduce to 100m
+                              # if you want to pack more pods per node.
+              memory: "256Mi" # Static file serving with nginx typically uses 20-50MB.
+                              # 256Mi is conservative — reduce to 128Mi if memory is scarce.
+            limits:
+              cpu: "500m"     # nginx is unlikely to ever hit 500m CPU doing static serving.
+                              # This cap prevents a misbehaving container from affecting
+                              # neighbouring pods on the same node.
+              memory: "512Mi" # Hard cap. nginx will be OOMKilled if it exceeds this.
+                              # Extremely unlikely for static file serving.
+
+          # ── Readiness probe ───────────────────────────────────────────────────
+          # What readiness does:
+          #   Pod is removed from Service endpoints if this probe fails.
+          #   No restart — pod stays alive, traffic just stops going to it.
+          #   Traffic resumes the moment the probe passes again.
+          #   Critical during rolling deploys: new pod must serve /health before
+          #   it receives real traffic from the Ingress.
+          readinessProbe:
+            httpGet:
+              path: /health   # nginx returns HTTP 200 for this path.
+                              # Defined in frontend/nginx/nginx.conf:
+                              #   location /health { return 200 "healthy\n"; }
+              port: 80        # nginx listens on 80. Must match containerPort.
+            initialDelaySeconds: 5   # nginx starts in ~1s. 5s is generous.
+                                     # Reduce to 2s if you want faster readiness detection.
+            periodSeconds: 10        # Check every 10 seconds.
+            failureThreshold: 3      # 3 consecutive failures (30 seconds) before
+                                     # removing this pod from the Service endpoints.
+            timeoutSeconds: 5        # nginx serving a static /health response
+                                     # should respond in milliseconds. 5s is safe.
+
+          # ── Liveness probe ────────────────────────────────────────────────────
+          # What liveness does:
+          #   Kills and restarts the container if this probe fails.
+          #   Unlike readiness, a liveness failure is destructive — the container
+          #   is forcefully stopped and restarted. Use this to recover from a
+          #   stuck or deadlocked nginx process.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 10  # Give nginx a full 10s to start.
+                                     # In practice it starts in ~1s, so 10s is very
+                                     # safe. Lower only if you need faster crash detection.
+            periodSeconds: 20        # Check every 20 seconds. nginx is either working
+                                     # or it isn't — no need to check more often.
+            timeoutSeconds: 3        # If nginx doesn't respond in 3s for a simple /health
+                                     # request, something is seriously wrong. Safe timeout.
+            failureThreshold: 3      # 3 × 20s = 60 seconds of failure before restart.
+                                     # Prevents restarting on a transient slow disk read.

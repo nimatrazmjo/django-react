@@ -1,0 +1,58 @@
+# db/hpa.yaml — HPA for PostgreSQL (intentionally locked to 1 replica).
+#
+# What this file does:
+#   This HPA exists for consistency with other services but is intentionally
+#   configured with minReplicas: 1 and maxReplicas: 1, effectively disabling
+#   automatic scaling.
+#
+# Why PostgreSQL cannot be horizontally scaled here:
+#   PostgreSQL in this configuration uses a single ReadWriteOnce PVC (Azure
+#   Managed Disk). Only one pod can mount this disk at a time. If the HPA
+#   tried to scale to 2 pods, the second pod would be stuck in Pending state
+#   waiting for the disk to be released — and the first pod would not release
+#   it while still running.
+#
+#   True PostgreSQL HA requires streaming replication (primary + replicas),
+#   separate PVCs for each instance, and a StatefulSet — or better:
+#   Azure Database for PostgreSQL which handles all of this for you.
+#
+#   If you migrate to Azure Database for PostgreSQL, delete this entire
+#   k8s/db/ directory and update DATABASE_URL.
+#
+# How to apply:
+#   kubectl apply -f k8s/db/hpa.yaml
+#
+# How to verify:
+#   kubectl get hpa db-hpa -n production
+#   kubectl describe hpa db-hpa -n production
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: db-hpa
+  namespace: production
+
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: db
+
+  minReplicas: 1   # PostgreSQL cannot safely run as multiple replicas with a single PVC.
+                   # See header comment. Do not increase this without a full HA setup.
+
+  maxReplicas: 1   # Locked to 1. The HPA will not scale beyond this regardless of load.
+                   # If PostgreSQL is under heavy load, scale vertically: increase the
+                   # CPU/memory requests and limits in deployment.yaml, not replicas.
+
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 80  # Threshold is set high (80%) because this HPA
+                                  # cannot actually scale out. This metric is here
+                                  # only to alert you via HPA events in kubectl describe
+                                  # when PostgreSQL is under CPU pressure — treat it
+                                  # as an operational signal, not an auto-remediation.

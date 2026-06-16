@@ -1,0 +1,57 @@
+# redis/hpa.yaml — HPA for Redis (intentionally locked to 1 replica).
+#
+# What this file does:
+#   This HPA exists for consistency with other services but is intentionally
+#   configured with minReplicas: 1 and maxReplicas: 1, effectively disabling
+#   automatic scaling.
+#
+# Why Redis cannot be horizontally scaled here:
+#   This is a standalone Redis instance. Running multiple replicas would give
+#   you multiple independent Redis processes that do not share data. Each backend
+#   pod would randomly connect to a different Redis pod and get a different cache
+#   view — cache hits would plummet and session data would be lost between requests.
+#
+#   For horizontal Redis scaling you need Redis Cluster (partitioned) or Redis
+#   Sentinel (HA with a primary + replicas). Both require StatefulSets and
+#   significantly more configuration. Azure Cache for Redis handles all of this
+#   for you and is strongly recommended for production.
+#
+#   If Redis is consistently under memory pressure, scale VERTICALLY:
+#   increase the memory limit in deployment.yaml and the --maxmemory argument.
+#
+# How to apply:
+#   kubectl apply -f k8s/redis/hpa.yaml
+#
+# How to verify:
+#   kubectl get hpa redis-hpa -n production
+#   kubectl describe hpa redis-hpa -n production
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: redis-hpa
+  namespace: production
+
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: redis
+
+  minReplicas: 1   # Standalone Redis cannot safely run as multiple replicas.
+                   # See header comment. Do not increase this without Redis Cluster setup.
+
+  maxReplicas: 1   # Locked to 1. Use vertical scaling (more memory/CPU) not horizontal.
+
+  metrics:
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80  # Since scaling is locked to 1, this metric will not
+                                  # trigger actual scaling. It serves as an observability
+                                  # signal: when Redis memory usage approaches 80% of its
+                                  # request (256Mi × 80% = 204Mi), kubectl describe hpa
+                                  # will show it as above target — your cue to increase
+                                  # the --maxmemory flag and memory limits in deployment.yaml.

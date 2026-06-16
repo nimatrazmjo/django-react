@@ -1,0 +1,85 @@
+# backend/hpa.yaml — Horizontal Pod Autoscaler for the Django backend.
+#
+# What this file does:
+#   The HPA automatically adjusts the number of backend pods based on CPU
+#   and memory usage. It runs as a control loop in the Kubernetes control plane.
+#
+# How the HPA control loop works:
+#   1. Every 15 seconds, the HPA queries the Metrics Server for CPU and memory
+#      across all currently running backend pods.
+#   2. For each metric it calculates:
+#        desiredReplicas = ceil(currentReplicas × (actualMetric / targetMetric))
+#      Example: 3 pods at 80% CPU with a 60% target:
+#        ceil(3 × 80/60) = ceil(4.0) = 4 pods → scale up to 4
+#   3. When multiple metrics are configured (CPU + memory), the HPA calculates
+#      a desired replica count for each and takes the MAXIMUM. This ensures
+#      the cluster scales up if EITHER resource is under pressure.
+#   4. Scale-up is applied immediately once the threshold is breached.
+#   5. Scale-down waits 5 minutes of sustained low utilisation before reducing
+#      replicas. This prevents thrashing (scale down → spike → scale up → repeat).
+#
+# Prerequisite: Metrics Server must be installed in the cluster.
+#   kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+#   Verify: kubectl top pods -n production
+#
+# How to apply:
+#   kubectl apply -f k8s/backend/hpa.yaml
+#
+# How to verify:
+#   kubectl get hpa backend-hpa -n production
+#   kubectl describe hpa backend-hpa -n production
+#   # The TARGETS column shows current vs target metrics.
+#   # "unknown" means Metrics Server is not installed or pods have no requests set.
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: backend-hpa
+  namespace: production
+
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend      # Must match the Deployment name in deployment.yaml.
+
+  minReplicas: 2       # Never scale below 2 pods, even at zero traffic.
+                       # 1 pod = single point of failure. If it crashes or is
+                       # evicted for node maintenance, there is a gap with zero
+                       # pods serving — causing downtime until a new pod starts.
+                       # 2 pods ensures one always survives a single pod loss.
+
+  maxReplicas: 10      # Hard ceiling. HPA will never exceed 10 pods regardless of load.
+                       # Set based on: node capacity, cost budget, and expected peak traffic.
+                       # If all 10 pods are pegged at 90% CPU, you have hit this ceiling.
+                       # Options: increase maxReplicas, or scale up node size / count
+                       # (Cluster Autoscaler handles node scaling automatically in AKS).
+
+  metrics:
+    # ── CPU scaling ────────────────────────────────────────────────────────────
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60  # Scale when average CPU across all backend pods exceeds
+                                  # 60% of their CPU request (250m × 60% = 150m per pod).
+                                  # At 60%, each pod has 40% headroom available.
+                                  # This matters because new pods take 60-90 seconds to start:
+                                  # if you wait until 90% to scale, users are already degraded.
+                                  # Setting this too low (e.g. 20%) causes constant churn.
+                                  # Setting this too high (e.g. 85%) means you scale too late.
+
+    # ── Memory scaling ─────────────────────────────────────────────────────────
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70  # Scale when average memory across pods exceeds 70% of
+                                  # their memory request (256Mi × 70% ≈ 179Mi per pod).
+                                  # Memory does not compress: if a pod exceeds its limit
+                                  # (512Mi), it is OOMKilled immediately. Scale before that.
+                                  # Unlike CPU, memory rarely drops after a spike without
+                                  # a restart, so memory-based HPA scale-down is slower to
+                                  # trigger in practice — that is intentional and safe.

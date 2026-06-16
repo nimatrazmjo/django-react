@@ -1,0 +1,170 @@
+# db/deployment.yaml — Runs PostgreSQL 16 as a single-replica pod in Kubernetes.
+#
+# What this file does:
+#   Deploys the official postgres:16-alpine image with a persistent volume
+#   for data storage. This mirrors the db service from docker-compose.yml.
+#
+# ⚠️  IMPORTANT — replicas is intentionally set to 1 (not 2).
+#   PostgreSQL cannot be horizontally scaled with a simple Deployment.
+#   Running 2+ replicas of this Deployment would cause both pods to mount
+#   the same Azure Managed Disk and write concurrently — this corrupts data.
+#   For true HA PostgreSQL in Kubernetes, you need a StatefulSet with streaming
+#   replication (e.g. via CloudNativePG operator). For most teams, Azure Database
+#   for PostgreSQL is the simpler and safer production choice.
+#
+# ⚠️  PRODUCTION RECOMMENDATION:
+#   Replace this entire Deployment with Azure Database for PostgreSQL.
+#   Update the DATABASE_URL secret and delete k8s/db/ entirely.
+#   This Deployment is here as a functional starting point, not a production target.
+#
+# How to apply:
+#   kubectl apply -f k8s/db/pvc.yaml     # Apply PVC first to provision the disk
+#   kubectl apply -f k8s/db/deployment.yaml
+#
+# How to verify:
+#   kubectl get deployment db -n production
+#   kubectl get pod -l app=db -n production
+#   kubectl logs -l app=db -n production
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db
+  namespace: production
+  labels:
+    app: db
+
+spec:
+  replicas: 1    # MUST be 1 for PostgreSQL with a single PVC.
+                 # See header comment above for explanation.
+                 # Do not increase this without a proper HA setup.
+
+  selector:
+    matchLabels:
+      app: db
+
+  strategy:
+    type: Recreate   # Stop the old pod BEFORE starting the new one.
+                     # This is required for single-disk stateful workloads:
+                     # the Azure Managed Disk (ReadWriteOnce) can only be mounted
+                     # by one node at a time. RollingUpdate would try to start
+                     # the new pod before stopping the old one, causing a mount
+                     # conflict and leaving the new pod stuck in Pending state.
+
+  template:
+    metadata:
+      labels:
+        app: db
+
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine  # Official PostgreSQL image. No custom build needed.
+                                     # Not pulled from ACR — this is a public Docker Hub image.
+                                     # Pin to a specific patch version (e.g. 16.3-alpine) in
+                                     # production to avoid unexpected upgrades on pod restart.
+
+          imagePullPolicy: IfNotPresent  # Only pull from Docker Hub if not already on this node.
+                                         # postgres is a stable image — IfNotPresent reduces
+                                         # unnecessary registry traffic and speeds up pod starts.
+
+          ports:
+            - containerPort: 5432  # Standard PostgreSQL port. Internal to the cluster.
+                                   # Never exposed publicly — the db Service is ClusterIP only.
+
+          # ── Environment variables ──────────────────────────────────────────────
+          # PostgreSQL reads these on first boot to create the database and user.
+          # On subsequent starts, these are ignored if data already exists in the PVC.
+          # These values must match the credentials in the DATABASE_URL secret.
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: POSTGRES_USER       # The database superuser to create on init.
+
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: POSTGRES_PASSWORD   # Password for POSTGRES_USER. Use a strong random value.
+
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: POSTGRES_DB         # Name of the database to create on init (e.g. myapp_prod).
+
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+              # Subdirectory within the mounted volume for PostgreSQL data files.
+              # PostgreSQL requires the data directory to be a subdirectory of the
+              # mount point when using certain volume types — this avoids "lost+found"
+              # directory conflicts that prevent postgres from initialising.
+
+          # ── Resource guarantees and limits ────────────────────────────────────
+          resources:
+            requests:
+              cpu: "250m"     # PostgreSQL idle uses very little CPU. Under write-heavy load
+                              # or during VACUUM, it can spike. 250m is a safe minimum.
+              memory: "256Mi" # PostgreSQL uses shared_buffers for caching. Default is 128MB.
+                              # 256Mi request covers that plus overhead.
+                              # If you tune shared_buffers higher, increase this request too.
+            limits:
+              cpu: "500m"     # Allow postgres to burst to 0.5 CPU for queries and VACUUM.
+                              # CPU throttling slows queries but does not kill the process.
+                              # Increase if you see consistently high CPU in kubectl top pod.
+              memory: "512Mi" # 512MB hard cap. If PostgreSQL exceeds this it is OOMKilled.
+                              # OOMKill during a write = potential data corruption.
+                              # Monitor memory carefully and increase before hitting this limit.
+                              # If you increase shared_buffers, increase this limit proportionally.
+
+          # ── Volume mount ──────────────────────────────────────────────────────
+          volumeMounts:
+            - name: postgres-storage
+              mountPath: /var/lib/postgresql/data  # Standard PostgreSQL data directory.
+                                                   # All database files live here.
+                                                   # Backed by the Azure Managed Disk from pvc.yaml.
+
+          # ── Readiness probe ───────────────────────────────────────────────────
+          # What readiness does:
+          #   Removes this pod from the db Service endpoints until PostgreSQL is
+          #   ready to accept connections. The backend entrypoint.sh also does its
+          #   own DB wait loop, but the readiness probe protects the Service layer.
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+              # pg_isready exits 0 when PostgreSQL is accepting connections.
+              # Uses "postgres" as the user to check — must match POSTGRES_USER
+              # or use a user that always exists (postgres superuser does).
+            initialDelaySeconds: 10  # PostgreSQL typically initialises in 3-5 seconds.
+                                     # 10s gives it room during slow node starts.
+            periodSeconds: 5         # Check every 5 seconds. DB readiness is binary —
+                                     # no need to wait long between checks.
+            failureThreshold: 6      # Allow 30 seconds (6 × 5s) of failure before marking
+                                     # not-ready. First-boot initialisation can take longer.
+            timeoutSeconds: 5
+
+          # ── Liveness probe ────────────────────────────────────────────────────
+          # What liveness does:
+          #   Kills and restarts the PostgreSQL container if it becomes unresponsive.
+          #   This is a last resort — a PostgreSQL restart is disruptive.
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 30  # Give PostgreSQL 30s to fully initialise before
+                                     # liveness starts. First-boot init includes creating
+                                     # the database and running initdb — this takes time.
+                                     # Killing postgres during init corrupts the data directory.
+            periodSeconds: 20        # Check every 20 seconds. Liveness for a DB should
+                                     # not fire often — only to recover truly stuck processes.
+            timeoutSeconds: 5        # pg_isready is fast. 5s is safe.
+            failureThreshold: 3      # 3 × 20s = 60 seconds of unresponsiveness before restart.
+                                     # Set high enough that a slow query doesn't trigger it.
+
+      # ── Volumes ───────────────────────────────────────────────────────────────
+      volumes:
+        - name: postgres-storage
+          persistentVolumeClaim:
+            claimName: postgres-data  # Must match metadata.name in pvc.yaml.
+                                      # This mounts the Azure Managed Disk into the container.

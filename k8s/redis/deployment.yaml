@@ -1,0 +1,143 @@
+# redis/deployment.yaml — Runs Redis 7 as a single-replica pod in Kubernetes.
+#
+# What this file does:
+#   Deploys the official redis:7-alpine image for caching and session storage.
+#   This mirrors the redis service from docker-compose.yml.
+#
+# ⚠️  IMPORTANT — replicas is intentionally set to 1 (not 2).
+#   Redis in standalone mode is a single-writer instance. Running multiple
+#   replicas of this Deployment would give you multiple independent Redis
+#   instances that do not share data — your backend would cache-miss constantly
+#   because each request might hit a different pod.
+#   Redis clustering/Sentinel is the correct approach for HA Redis in Kubernetes,
+#   but it adds significant complexity. For most applications, Azure Cache for
+#   Redis is the simpler production choice.
+#
+# ⚠️  PRODUCTION RECOMMENDATION:
+#   Replace this Deployment with Azure Cache for Redis.
+#   https://learn.microsoft.com/en-us/azure/azure-cache-for-redis/
+#   Benefits: managed HA, automatic failover, persistence, no pod management.
+#   Update REDIS_URL to point at the Azure Cache endpoint and delete k8s/redis/.
+#
+# Note: Redis data is in-memory only in this configuration. If the pod restarts,
+# all cached data is lost. For Django session data backed by Redis, this means
+# users will be logged out on pod restart. If persistence is needed, add a PVC
+# and configure Redis appendonly mode — or use Azure Cache for Redis.
+#
+# How to apply:
+#   kubectl apply -f k8s/redis/deployment.yaml
+#
+# How to verify:
+#   kubectl get deployment redis -n production
+#   kubectl exec -it <redis-pod> -n production -- redis-cli ping
+#   # Should return: PONG
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: production
+  labels:
+    app: redis
+
+spec:
+  replicas: 1    # MUST be 1 for standalone Redis. See header comment.
+                 # Do not increase without a proper Redis Cluster / Sentinel setup.
+
+  selector:
+    matchLabels:
+      app: redis
+
+  strategy:
+    type: Recreate   # Stop old pod before starting new one.
+                     # RollingUpdate would try to run two Redis pods simultaneously.
+                     # While Redis doesn't have disk contention issues like PostgreSQL,
+                     # two standalone pods means split cache — worse than a brief restart.
+
+  template:
+    metadata:
+      labels:
+        app: redis
+
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine  # Official Redis image. No custom build needed.
+                                 # Pin to a specific patch version (e.g. 7.2.4-alpine)
+                                 # in production to avoid surprise upgrades on pod restart.
+
+          imagePullPolicy: IfNotPresent  # Only pull from Docker Hub if not cached locally.
+                                         # redis:7-alpine is a stable, frequently cached image.
+
+          ports:
+            - containerPort: 6379  # Standard Redis port. Internal to the cluster only.
+                                   # Never expose Redis publicly — no authentication
+                                   # is configured in this basic setup.
+
+          # ── Resource guarantees and limits ────────────────────────────────────
+          resources:
+            requests:
+              cpu: "250m"     # Redis is typically CPU-light unless doing many complex
+                              # operations (SORT, SUNION, Lua scripts). 250m is generous
+                              # for a typical caching workload. Reduce to 100m if needed.
+              memory: "256Mi" # All Redis data lives in memory. This limit must be larger
+                              # than your expected cache dataset + Redis overhead (~10MB).
+                              # Monitor actual usage with: redis-cli info memory
+                              # If maxmemory is not configured, Redis will grow unbounded
+                              # until it hits this limit and gets OOMKilled.
+            limits:
+              cpu: "500m"     # Hard cap. Redis is single-threaded for most operations;
+                              # it will rarely use more than 1 CPU core regardless.
+              memory: "512Mi" # Hard cap at 512MB. If Redis exceeds this it is OOMKilled
+                              # and the cache is wiped. Configure maxmemory in redis.conf
+                              # (or via --maxmemory flag) to stay well below this limit
+                              # and use an eviction policy instead of OOMKill.
+                              # Recommended: add --maxmemory 400mb --maxmemory-policy allkeys-lru
+                              # to the command below.
+
+          command: ["redis-server"]
+          args:
+            - "--maxmemory"
+            - "400mb"           # Redis will not grow beyond 400MB of data.
+                                # This leaves 112MB headroom before hitting the 512Mi limit.
+                                # Adjust based on your expected cache size.
+            - "--maxmemory-policy"
+            - "allkeys-lru"     # When memory is full, evict the least recently used keys.
+                                # This is the correct policy for a pure cache.
+                                # If Redis is used for sessions or queues (not just cache),
+                                # use "noeviction" instead and increase memory limits.
+            - "--save"
+            - ""                # Disable RDB snapshots (persistence).
+                                # This pod has no persistent volume, so snapshots would
+                                # be written to the container filesystem and lost on restart.
+                                # If you need persistence, add a PVC and remove this flag.
+
+          # ── Readiness probe ───────────────────────────────────────────────────
+          # What readiness does:
+          #   Keeps the pod out of the Service endpoint list until Redis is ready
+          #   to accept commands. Redis starts in ~100ms but we probe to be safe.
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+              # redis-cli ping returns "PONG" and exits 0 when Redis is accepting commands.
+              # Any other exit code marks the pod as not ready.
+            initialDelaySeconds: 5   # Redis starts almost instantly. 5s is generous.
+            periodSeconds: 5         # Check every 5 seconds.
+            failureThreshold: 3      # 3 consecutive failures (15s) before marking not-ready.
+            timeoutSeconds: 3        # ping response time should be sub-millisecond.
+
+          # ── Liveness probe ────────────────────────────────────────────────────
+          # What liveness does:
+          #   Kills and restarts the Redis container if it becomes unresponsive.
+          #   A Redis restart clears all in-memory data — this is acceptable for a
+          #   pure cache but disrupts sessions. Log and alert on liveness failures.
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 15  # Give Redis 15s after container start before checking.
+                                     # Redis starts in ~100ms, so 15s is very conservative —
+                                     # but liveness kills on failure, so we prefer safety.
+            periodSeconds: 20        # Check every 20 seconds.
+            timeoutSeconds: 3
+            failureThreshold: 3      # 3 × 20s = 60 seconds of unresponsiveness before restart.
+                                     # A single slow response should not trigger a cache wipe.

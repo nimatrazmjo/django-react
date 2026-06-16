@@ -1,0 +1,45 @@
+# frontend/service.yaml — Internal ClusterIP Service for the React frontend.
+#
+# What this file does:
+#   Gives the frontend Deployment a stable internal DNS name so the Ingress
+#   controller can route traffic to it. All public traffic enters through the
+#   Ingress (ingress.yaml) which forwards to this Service.
+#
+#   This Service is type: ClusterIP, which means:
+#   - It is ONLY reachable from inside the Kubernetes cluster.
+#   - It is NOT directly accessible from the internet.
+#   - The Ingress controller (running in its own namespace) reaches it at:
+#       http://frontend.production.svc.cluster.local:80
+#
+#   Why not type: LoadBalancer?
+#   Each LoadBalancer Service provisions a dedicated Azure Load Balancer with
+#   its own public IP — this costs money (roughly $18/month per LB in Azure)
+#   and creates multiple public entry points. The Ingress is one LB for all
+#   services, which is both cheaper and simpler to manage (one IP, one TLS cert).
+#
+# How to apply:
+#   kubectl apply -f k8s/frontend/service.yaml
+#
+# How to verify:
+#   kubectl get service frontend -n production
+#   kubectl describe service frontend -n production
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend     # DNS hostname for in-cluster access: http://frontend:80
+                     # Referenced by ingress.yaml backend.service.name.
+  namespace: production
+
+spec:
+  type: ClusterIP    # Internal only. The Ingress is the public entry point.
+
+  selector:
+    app: frontend    # Routes to pods with label app: frontend.
+                     # Must match labels in frontend/deployment.yaml pod template.
+
+  ports:
+    - name: http
+      port: 80           # Port that the Ingress connects to when routing / traffic.
+      targetPort: 80     # Port nginx listens on inside the container (containerPort in deployment).
+      protocol: TCP
