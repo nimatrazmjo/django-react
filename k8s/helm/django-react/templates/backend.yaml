@@ -1,0 +1,159 @@
+# ── Backend Deployment ────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "django-react.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backend
+    app: backend
+  annotations:
+    # Force pod restart on Secret/ConfigMap changes when using helm upgrade.
+    # Without this, pods use the old env vars until manually restarted.
+    checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+spec:
+  replicas: {{ .Values.backend.replicaCount }}
+  selector:
+    matchLabels:
+      app: backend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        {{- include "django-react.labels" . | nindent 8 }}
+        app: backend
+        app.kubernetes.io/component: backend
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: backend-sa
+      {{- include "django-react.securityContext" . | nindent 6 }}
+      {{- include "django-react.imagePullSecrets" . | nindent 6 }}
+      {{- include "django-react.topologySpread" (dict "enabled" .Values.backend.topologySpreadEnabled "appLabel" "backend") | nindent 6 }}
+
+      # Graceful shutdown: give gunicorn 30s to finish in-flight requests before SIGKILL.
+      # Must be >= gunicorn graceful_timeout (default 30s).
+      terminationGracePeriodSeconds: 60
+
+      containers:
+        - name: backend
+          image: {{ include "django-react.image" (dict "image" .Values.backend.image "global" .Values.global) }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.backend.service.port }}
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secrets
+          {{- with .Values.backend.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- include "django-react.probes" (dict "probes" .Values.backend.probes "port" .Values.backend.service.port) | nindent 10 }}
+          resources:
+            {{- toYaml .Values.backend.resources | nindent 12 }}
+          {{- include "django-react.containerSecurityContext" . | nindent 10 }}
+          # Writable tmp dir (read-only root filesystem is disabled for gunicorn)
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+---
+# ── Backend Service ───────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "django-react.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backend
+spec:
+  type: {{ .Values.backend.service.type }}
+  selector:
+    app: backend
+  ports:
+    - name: http
+      port: {{ .Values.backend.service.port }}
+      targetPort: {{ .Values.backend.service.port }}
+      protocol: TCP
+
+---
+# ── Backend HPA ───────────────────────────────────────────────────────────────
+{{- if .Values.backend.hpa.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: backend-hpa
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "django-react.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backend
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend
+  minReplicas: {{ .Values.backend.hpa.minReplicas }}
+  maxReplicas: {{ .Values.backend.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.backend.hpa.cpuUtilization }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.backend.hpa.memoryUtilization }}
+  behavior:
+    scaleDown:
+      # Wait 5 minutes of sustained low load before scaling down.
+      # Prevents flapping: load spikes don't cause rapid scale-up/scale-down cycles.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1         # Remove at most 1 pod per scaling period
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0   # Scale up immediately when load spikes
+      policies:
+        - type: Pods
+          value: 2         # Add up to 2 pods per period during surge
+          periodSeconds: 60
+{{- end }}
+
+---
+# ── Backend PodDisruptionBudget ───────────────────────────────────────────────
+{{- if .Values.backend.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: backend-pdb
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "django-react.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backend
+spec:
+  minAvailable: {{ .Values.backend.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      app: backend
+{{- end }}

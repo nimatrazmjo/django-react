@@ -31,17 +31,18 @@ name: Build and Deploy to AKS
 on:
   push:
     branches:
-      - main     # → production deploy
-      - staging  # → staging deploy
-      - qa       # → qa deploy
+      - main # → production deploy
+      - staging # → staging deploy
+      - qa # → qa deploy
     # All other branches (feature/*, fix/*, etc.) do NOT trigger any deploy.
     # Open a PR against qa to start the promotion chain: qa → staging → main.
 
 # ── OIDC permissions ──────────────────────────────────────────────────────────
 permissions:
-  id-token: write  # Lets this workflow request a GitHub OIDC token to exchange
-                   # for a short-lived Azure access token. Required by azure/login.
-  contents: read   # Lets the workflow check out the repository.
+  id-token:
+    write # Lets this workflow request a GitHub OIDC token to exchange
+    # for a short-lived Azure access token. Required by azure/login.
+  contents: read # Lets the workflow check out the repository.
 
 # ── Shared environment variables ──────────────────────────────────────────────
 env:
@@ -142,13 +143,13 @@ jobs:
           # It must match the public hostname of the API for each environment.
           # Update these URLs to match your actual domain names.
           if [[ "$BRANCH" == "main" ]]; then
-            VITE_API_URL="https://myapp.com"
+            VITE_API_URL="https://127.0.0.1.nip.io"
             VITE_ENV="production"
           elif [[ "$BRANCH" == "staging" ]]; then
-            VITE_API_URL="https://staging.myapp.com"
+            VITE_API_URL="https://staging.127.0.0.1.nip.io"
             VITE_ENV="staging"
           else
-            VITE_API_URL="https://qa.myapp.com"
+            VITE_API_URL="https://qa.127.0.0.1.nip.io"
             VITE_ENV="qa"
           fi
 
@@ -237,7 +238,7 @@ jobs:
         # or node has insufficient capacity.
 
       - name: Show QA pod status
-        if: always()   # Run even if a previous step failed — useful for debugging.
+        if: always() # Run even if a previous step failed — useful for debugging.
         run: kubectl get pods -n qa
         # Final visual confirmation. All pods should show Running / Ready (1/1 or 2/2).
 

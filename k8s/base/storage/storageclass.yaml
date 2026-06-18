@@ -1,0 +1,99 @@
+# storage/storageclass.yaml
+#
+# StorageClass defines HOW a PersistentVolume is provisioned on-demand when a
+# PersistentVolumeClaim requests storage. It is cluster-scoped (no namespace).
+#
+# Without a custom StorageClass, the cluster uses its default class (often
+# "default" on AKS, which provisions Standard HDD). For a production database
+# you want Premium SSD (lower latency, higher IOPS).
+#
+# This file defines two StorageClasses:
+#   1. managed-premium  — Azure Premium SSD (P10: 128GB, 500 IOPS, 100 MB/s)
+#                         Use for PostgreSQL data volumes.
+#   2. managed-standard — Azure Standard SSD (balanced cost/performance)
+#                         Use for Redis AOF persistence if enabled.
+#
+# Azure disk tiers (relevant for production sizing):
+#   Premium SSD P10: 128GB, 500 IOPS, 100 MB/s  — fine for small DBs < 10k RPM
+#   Premium SSD P20: 512GB, 2300 IOPS, 150 MB/s — for heavy write workloads
+#   Premium SSD P30: 1TB,   5000 IOPS, 200 MB/s — large production databases
+#
+# PVC size determines the tier: a 20Gi PVC gets a P4 disk (32GB, 120 IOPS).
+# Resize the PVC to 128Gi to automatically step up to P10 (500 IOPS).
+#
+# How to verify available StorageClasses in your cluster:
+#   kubectl get storageclasses
+#   kubectl describe storageclass managed-premium
+
+# ── Premium SSD (PostgreSQL) ──────────────────────────────────────────────────
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: managed-premium
+  labels:
+    app.kubernetes.io/part-of: django-react
+  annotations:
+    # Do NOT set storageclass.kubernetes.io/is-default-class: "true" here.
+    # Only one StorageClass should be the cluster default.
+    # If you set this AND the cluster already has a default class, PVCs without
+    # an explicit storageClassName will break with an ambiguous class error.
+    description: "Azure Premium SSD for PostgreSQL — low latency, high IOPS"
+provisioner: disk.csi.azure.com   # Azure Disk CSI driver (built into AKS 1.21+).
+                                   # If using AKS < 1.21: use kubernetes.io/azure-disk instead.
+parameters:
+  skuName: Premium_LRS             # Premium Locally Redundant Storage.
+                                   # Premium_ZRS for zone-redundant (available in some regions).
+                                   # Standard_LRS for cheaper non-premium disks.
+  kind: Managed                    # Azure managed disk (recommended over blob-backed).
+  cachingMode: ReadOnly            # Disk-level read cache: improves read performance.
+                                   # ReadOnly: safe for databases (reads cached, writes bypass cache).
+                                   # ReadWrite: adds write-back cache — risky for databases
+                                   # (unacked writes on Azure host cache can cause data loss on host failure).
+                                   # None: no caching — use for write-heavy workloads where cache helps little.
+
+reclaimPolicy: Retain              # When the PVC is deleted, the PV is NOT deleted.
+                                   # The data disk survives and can be manually re-attached.
+                                   # Use Retain for databases — you can recover from accidental PVC deletion.
+                                   # Never use Delete for production databases.
+
+allowVolumeExpansion: true         # Allows kubectl patch pvc to resize the disk online (AKS 1.24+).
+                                   # The disk grows; PostgreSQL sees the new size after pod restart.
+                                   # You may also need to resize the filesystem inside the pod:
+                                   #   kubectl exec -it <db-pod> -- resize2fs /dev/sdb
+                                   # (Azure Disk CSI driver handles this automatically in recent versions)
+
+volumeBindingMode: WaitForFirstConsumer
+                                   # Do NOT provision the disk until a pod is scheduled.
+                                   # This ensures the disk is created in the SAME AZ as the pod.
+                                   # Without this (Immediate mode), the disk might land in AZ-A
+                                   # while the pod schedules on a node in AZ-B — and the pod
+                                   # can't mount the disk across AZs. Always use WaitForFirstConsumer
+                                   # in multi-AZ clusters.
+
+mountOptions:
+  - barrier=0       # Disables filesystem write barrier. Safe because Azure managed disks
+                    # have durable write-back caches — data is safe without barriers.
+                    # Improves write throughput by ~15-20% for PostgreSQL WAL writes.
+  - noatime         # Don't update access timestamps on reads. Minor IOPS savings for
+                    # read-heavy workloads on databases with many small files.
+
+---
+# ── Standard SSD (Redis AOF, non-critical persistence) ───────────────────────
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: managed-standard-ssd
+  labels:
+    app.kubernetes.io/part-of: django-react
+  annotations:
+    description: "Azure Standard SSD for Redis — balanced cost/performance for cache persistence"
+provisioner: disk.csi.azure.com
+parameters:
+  skuName: StandardSSD_LRS        # Standard SSD: better than HDD, cheaper than Premium.
+                                   # Suitable for Redis AOF files (sequential writes, not IOPS-heavy).
+  kind: Managed
+  cachingMode: None               # No cache for Redis AOF writes — Redis already manages
+                                   # its own write buffering via appendfsync settings.
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer

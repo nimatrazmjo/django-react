@@ -1,0 +1,116 @@
+# rbac/clusterroles.yaml
+#
+# ClusterRoles are not namespaced. They cover either:
+#   1. Cluster-scoped resources (Nodes, PersistentVolumes, StorageClasses, Namespaces)
+#   2. Resources in ALL namespaces at once (via ClusterRoleBinding)
+#   3. Resources in ONE specific namespace (via RoleBinding referencing this ClusterRole)
+#      — this pattern lets you reuse the same role definition across namespaces.
+#
+# This file defines read-only ClusterRoles for observability and health-check patterns.
+# The actual binding (which SA gets which role) is in clusterrolebindings.yaml.
+
+# ── Node reader ───────────────────────────────────────────────────────────────
+# Allows a monitoring/alerting SA to read Node metrics and conditions.
+# Useful if you run a custom cluster-health sidecar or want pod-to-node affinity
+# logic in the app. NOT granted to backend/frontend SAs — they never need this.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: django-react-node-reader
+  labels:
+    app.kubernetes.io/part-of: django-react
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes/status"]
+    verbs: ["get"]
+
+---
+# ── PersistentVolume reader ───────────────────────────────────────────────────
+# Allows the CI/CD SA to verify PV provisioning status after a deploy.
+# PVs are cluster-scoped (no namespace), so this must be a ClusterRole.
+# Bound to the CI SA via ClusterRoleBinding scoped to the deployer identity.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: django-react-pv-reader
+  labels:
+    app.kubernetes.io/part-of: django-react
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+
+---
+# ── Ingress status reader ─────────────────────────────────────────────────────
+# Needed by external tools (uptime monitors, custom controllers) that watch
+# Ingress resources across namespaces to detect routing changes.
+# Scope this to specific SAs via ClusterRoleBinding, NOT to all authenticated users.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: django-react-ingress-reader
+  labels:
+    app.kubernetes.io/part-of: django-react
+rules:
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "ingressclasses"]
+    verbs: ["get", "list", "watch"]
+
+---
+# ── Namespace-scoped deployer (reusable across envs) ─────────────────────────
+# This ClusterRole mirrors cicd-deployer (roles.yaml) but is reusable:
+# bind it to a RoleBinding in staging, qa, or production to grant the same
+# CI permissions in each namespace without duplicating Role definitions.
+#
+# When you bind a ClusterRole with a RoleBinding (not ClusterRoleBinding),
+# the permissions are still scoped to that specific namespace only.
+# This is the recommended pattern for multi-environment CI SAs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: django-react-namespace-deployer
+  labels:
+    app.kubernetes.io/part-of: django-react
+    app.kubernetes.io/component: cicd
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+  - apiGroups: ["apps"]
+    resources: ["deployments/status", "deployments/scale", "statefulsets/scale"]
+    verbs: ["get", "update", "patch"]
+
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "pods/status"]
+    verbs: ["get", "list", "watch"]
+
+  - apiGroups: [""]
+    resources: ["services", "endpoints", "configmaps", "serviceaccounts"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
+
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+  - apiGroups: ["cert-manager.io"]
+    resources: ["certificates", "certificaterequests", "issuers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]

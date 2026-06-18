@@ -1,0 +1,69 @@
+# network-policies/frontend.yaml
+#
+# The frontend pod (nginx serving React static files) is the most restricted:
+#   - Inbound: only from the ingress controller
+#   - Outbound: only DNS (to resolve backend service name for health checks)
+#
+# The frontend pod does NOT talk to the backend at runtime in k8s.
+# The React app makes API calls from the user's browser → ingress → backend.
+# The nginx proxy_pass to the backend in nginx.conf is a fallback for direct-pod
+# access during development; in k8s all traffic routes through the Ingress.
+
+# ── Ingress to frontend ───────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontend-ingress
+  namespace: production
+  labels:
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/part-of: django-react
+spec:
+  podSelector:
+    matchLabels:
+      app: frontend
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+      ports:
+        - port: 80
+          protocol: TCP
+
+---
+# ── Egress from frontend ──────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontend-egress
+  namespace: production
+  labels:
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/part-of: django-react
+spec:
+  podSelector:
+    matchLabels:
+      app: frontend
+  policyTypes:
+    - Egress
+  egress:
+    # DNS only — the frontend nginx needs name resolution for its health check endpoint.
+    # It does NOT need to reach the backend pod directly in production.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP

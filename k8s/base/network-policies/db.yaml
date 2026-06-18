@@ -1,0 +1,78 @@
+# network-policies/db.yaml
+#
+# PostgreSQL is the most sensitive pod in the cluster. The attack surface must be minimal:
+#   - Inbound: ONLY the backend (and migration jobs) on port 5432
+#   - Outbound: DNS only (postgres needs name resolution for logical replication
+#     or external auth — mostly not needed, but harmless to allow)
+#
+# Critically: the frontend can NEVER reach the database, even if the frontend
+# is compromised. This is enforced at the network layer, not just app layer.
+
+# ── Ingress to db ─────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: db-ingress
+  namespace: production
+  labels:
+    app.kubernetes.io/component: db
+    app.kubernetes.io/part-of: django-react
+spec:
+  podSelector:
+    matchLabels:
+      app: db
+  policyTypes:
+    - Ingress
+  ingress:
+    # Backend pods → PostgreSQL
+    - from:
+        - podSelector:
+            matchLabels:
+              app: backend
+      ports:
+        - port: 5432
+          protocol: TCP
+
+    # Migration Job pods → PostgreSQL
+    # Migration pods are labeled app: migration in hooks/db-migrate.yaml
+    - from:
+        - podSelector:
+            matchLabels:
+              app: migration
+      ports:
+        - port: 5432
+          protocol: TCP
+
+---
+# ── Egress from db ────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: db-egress
+  namespace: production
+  labels:
+    app.kubernetes.io/component: db
+    app.kubernetes.io/part-of: django-react
+spec:
+  podSelector:
+    matchLabels:
+      app: db
+  policyTypes:
+    - Egress
+  egress:
+    # DNS only
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # No other egress — PostgreSQL has no reason to initiate outbound connections
+    # in this architecture. Logical replication to an external replica would
+    # require an additional rule here with the replica's IP block.

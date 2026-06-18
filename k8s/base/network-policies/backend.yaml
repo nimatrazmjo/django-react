@@ -1,0 +1,112 @@
+# network-policies/backend.yaml
+#
+# Defines exactly which traffic is allowed TO and FROM the Django backend pods.
+#
+# Allowed inbound (ingress):
+#   - From the nginx ingress controller pods (in the ingress-nginx namespace) on port 8000
+#   - From nothing else — frontend pods do NOT call the backend directly in k8s
+#     (they go through the Ingress, which proxies to the backend Service)
+#
+# Allowed outbound (egress):
+#   - To db on port 5432 (PostgreSQL)
+#   - To redis on port 6379
+#   - To kube-dns on port 53 UDP+TCP (service name resolution)
+#   - To the internet on port 443 (for Django to call external APIs if needed)
+#     Remove this if your backend never makes outbound HTTPS calls.
+
+# ── Ingress to backend ────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-ingress
+  namespace: production
+  labels:
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: django-react
+spec:
+  podSelector:
+    matchLabels:
+      app: backend   # Applies to all backend pods
+  policyTypes:
+    - Ingress
+  ingress:
+    # Allow traffic from the nginx ingress controller.
+    # The ingress-nginx namespace is created when you install the ingress controller:
+    #   helm install ingress-nginx ingress-nginx/ingress-nginx --namespace ingress-nginx
+    # The controller pods are labeled app.kubernetes.io/name: ingress-nginx.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx  # Only the ingress-nginx namespace
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx        # Only the controller pods
+      ports:
+        - port: 8000
+          protocol: TCP
+
+    # Allow liveness/readiness probes from the kubelet.
+    # Kubelet probes originate from the node (not a pod), so they appear as traffic
+    # from the node's IP, which is not covered by podSelector or namespaceSelector.
+    # Kubernetes automatically allows kubelet probe traffic regardless of NetworkPolicy —
+    # no rule needed here. This comment is kept as documentation.
+
+---
+# ── Egress from backend ───────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-egress
+  namespace: production
+  labels:
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: django-react
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes:
+    - Egress
+  egress:
+    # DNS resolution (kube-dns in kube-system namespace).
+    # Without this, service name lookups (db, redis) fail and the pod is effectively broken.
+    # kube-dns listens on UDP 53 and TCP 53.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+
+    # PostgreSQL: backend → db
+    - to:
+        - podSelector:
+            matchLabels:
+              app: db
+      ports:
+        - port: 5432
+          protocol: TCP
+
+    # Redis: backend → redis
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - port: 6379
+          protocol: TCP
+
+    # External HTTPS (e.g. Django calling third-party APIs, sending emails via SMTP-over-TLS).
+    # Remove this rule if your backend is fully internal.
+    # To harden further, replace with specific IP blocks for known external services.
+    - ports:
+        - port: 443
+          protocol: TCP
+        - port: 587   # SMTP-STARTTLS for email sending (e.g. SendGrid, SES)
+          protocol: TCP

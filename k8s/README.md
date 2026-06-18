@@ -50,21 +50,21 @@ k8s/
 
 ## Environment profiles at a glance
 
-| Setting | QA | Staging | Production |
-|---|---|---|---|
-| Namespace | `qa` | `staging` | `production` |
-| Branch | `qa` | `staging` | `main` |
-| Replicas (backend/frontend) | 1 | 2 | 2 |
-| CPU request | 100m | 200m | 250m |
-| CPU limit | 200m | 400m | 500m |
-| Memory request | 128Mi | 200Mi | 256Mi |
-| Memory limit | 256Mi | 400Mi | 512Mi |
-| HPA min replicas | 1 | 2 | 2 |
-| HPA max replicas | 3 | 6 | 10 |
-| HPA CPU target | 70% | 65% | 60% |
-| HPA memory target | 80% | 75% | 70% |
-| Redis maxmemory | 200mb | 320mb | 400mb |
-| Image tag prefix | `qa-` | `staging-` | _(none)_ |
+| Setting                     | QA    | Staging    | Production   |
+| --------------------------- | ----- | ---------- | ------------ |
+| Namespace                   | `qa`  | `staging`  | `production` |
+| Branch                      | `qa`  | `staging`  | `main`       |
+| Replicas (backend/frontend) | 1     | 2          | 2            |
+| CPU request                 | 100m  | 200m       | 250m         |
+| CPU limit                   | 200m  | 400m       | 500m         |
+| Memory request              | 128Mi | 200Mi      | 256Mi        |
+| Memory limit                | 256Mi | 400Mi      | 512Mi        |
+| HPA min replicas            | 1     | 2          | 2            |
+| HPA max replicas            | 3     | 6          | 10           |
+| HPA CPU target              | 70%   | 65%        | 60%          |
+| HPA memory target           | 80%   | 75%        | 70%          |
+| Redis maxmemory             | 200mb | 320mb      | 400mb        |
+| Image tag prefix            | `qa-` | `staging-` | _(none)_     |
 
 **QA:** single pod, minimal resources, high HPA thresholds. Cost over stability.
 **Staging:** mirrors production pod count (2), medium resources. Validates rolling update behaviour.
@@ -88,11 +88,13 @@ kubectl apply -k k8s/overlays/production
 ```
 
 **Preview the final rendered manifests without applying them:**
+
 ```bash
 kubectl kustomize k8s/overlays/qa
 kubectl kustomize k8s/overlays/staging
 kubectl kustomize k8s/overlays/production
 ```
+
 Use this to verify your overlay patches look correct before touching a live cluster.
 
 ---
@@ -205,13 +207,13 @@ kubectl set image deployment/frontend frontend=localhost:5000/frontend:latest  -
 
 **8. Route traffic via /etc/hosts**
 
-The ingress is configured for `myapp.com`. Add this line to `/etc/hosts` so your browser resolves it to localhost:
+The ingress is configured for `127.0.0.1.nip.io`. Add this line to `/etc/hosts` so your browser resolves it to localhost:
 
 ```
-127.0.0.1 myapp.com
+127.0.0.1 127.0.0.1.nip.io
 ```
 
-Then open `http://myapp.com`.
+Then open `http://127.0.0.1.nip.io`.
 
 **9. Verify everything is running**
 
@@ -236,6 +238,7 @@ docker stop local-registry && docker rm local-registry
 Before applying anything, ensure the following are installed and configured in your AKS cluster:
 
 **1. nginx ingress controller**
+
 ```bash
 helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
 helm repo update
@@ -244,12 +247,14 @@ helm install ingress-nginx ingress-nginx/ingress-nginx \
 ```
 
 **2. Metrics Server** (required for HPA to report targets — shows "unknown" without it)
+
 ```bash
 kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
 kubectl top nodes   # should return node CPU/memory after ~60 seconds
 ```
 
 **3. ACR pull secret** (one per namespace — repeat for each env)
+
 ```bash
 for NS in qa staging production; do
   kubectl create secret docker-registry acr-secret \
@@ -259,6 +264,7 @@ for NS in qa staging production; do
     -n $NS
 done
 ```
+
 Alternatively, assign the `AcrPull` role to the AKS kubelet managed identity — then remove `imagePullSecrets` from base deployment files entirely (preferred for AKS).
 
 ---
@@ -268,6 +274,7 @@ Alternatively, assign the `AcrPull` role to the AKS kubelet managed identity —
 `k8s/base/secrets.yaml` contains `<REPLACE_ME>` placeholders. Never apply it with placeholders.
 
 **Step 1: Generate your values**
+
 ```bash
 # Django secret key
 python -c "from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())"
@@ -277,6 +284,7 @@ openssl rand -base64 32
 ```
 
 **Step 2: Base64-encode each value** (use `-n` to avoid encoding a trailing newline)
+
 ```bash
 echo -n "your-actual-value" | base64
 ```
@@ -284,6 +292,7 @@ echo -n "your-actual-value" | base64
 **Step 3: Replace each `<REPLACE_ME>` in secrets.yaml**
 
 **Step 4: Apply, then restore the placeholder version immediately**
+
 ```bash
 kubectl apply -f k8s/base/secrets.yaml -n qa
 kubectl apply -f k8s/base/secrets.yaml -n staging
@@ -330,16 +339,17 @@ kubectl get all -n production
 
 Go to: GitHub → Settings → Secrets and variables → Actions → New repository secret
 
-| Secret | Where to find it |
-|---|---|
-| `AZURE_CLIENT_ID` | Azure AD → App registrations → your app → Application (client) ID |
-| `AZURE_TENANT_ID` | Azure AD → Overview → Directory (tenant) ID |
-| `AZURE_SUBSCRIPTION_ID` | Azure portal → Subscriptions |
-| `ACR_NAME` | ACR registry name without `.azurecr.io` (e.g. `myapp`) |
-| `AKS_CLUSTER_NAME` | AKS cluster name |
-| `AKS_RESOURCE_GROUP` | Resource group containing the AKS cluster |
+| Secret                  | Where to find it                                                  |
+| ----------------------- | ----------------------------------------------------------------- |
+| `AZURE_CLIENT_ID`       | Azure AD → App registrations → your app → Application (client) ID |
+| `AZURE_TENANT_ID`       | Azure AD → Overview → Directory (tenant) ID                       |
+| `AZURE_SUBSCRIPTION_ID` | Azure portal → Subscriptions                                      |
+| `ACR_NAME`              | ACR registry name without `.azurecr.io` (e.g. `myapp`)            |
+| `AKS_CLUSTER_NAME`      | AKS cluster name                                                  |
+| `AKS_RESOURCE_GROUP`    | Resource group containing the AKS cluster                         |
 
 **OIDC federated credential setup** — required for `azure/login@v2`:
+
 1. Azure AD → App registrations → your app → Certificates & secrets → Federated credentials
 2. Add one credential per branch (main, staging, qa), selecting Entity: Branch
 3. Grant the app: `AcrPush` on ACR, `Azure Kubernetes Service Cluster User Role` + `RBAC Writer` on AKS
@@ -349,6 +359,7 @@ Go to: GitHub → Settings → Secrets and variables → Actions → New reposit
 ## Debugging
 
 ### Pod status and events
+
 ```bash
 # List all pods and their status
 kubectl get pods -n production
@@ -364,6 +375,7 @@ kubectl get events -n production --sort-by='.lastTimestamp' | tail -30
 ```
 
 ### Logs
+
 ```bash
 # Logs from all pods of a deployment
 kubectl logs -l app=backend -n production --tail=100
@@ -376,6 +388,7 @@ kubectl logs <pod-name> -n production --previous
 ```
 
 ### Deployment health
+
 ```bash
 # Check rollout progress
 kubectl rollout status deployment/backend -n production
@@ -388,6 +401,7 @@ kubectl kustomize k8s/overlays/production
 ```
 
 ### HPA status
+
 ```bash
 # Shows TARGETS (current/desired), MINPODS, MAXPODS, REPLICAS
 kubectl get hpa -n production
@@ -398,6 +412,7 @@ kubectl describe hpa backend-hpa -n production
 ```
 
 ### Roll back a bad deploy
+
 ```bash
 # Option 1: Roll back to the previous Deployment revision (fastest)
 kubectl rollout undo deployment/backend -n production
@@ -413,6 +428,7 @@ kubectl rollout status deployment/backend -n production
 ```
 
 ### Shell into a running pod
+
 ```bash
 # Open an interactive shell
 kubectl exec -it <pod-name> -n production -- /bin/sh
@@ -422,6 +438,7 @@ kubectl exec -it <pod-name> -n production -- python manage.py migrate --plan
 ```
 
 ### Resource usage
+
 ```bash
 kubectl top pods -n production   # CPU + memory per pod (needs Metrics Server)
 kubectl top nodes                # CPU + memory per node

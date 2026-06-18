@@ -1,0 +1,63 @@
+# network-policies/redis.yaml
+#
+# Redis only accepts connections from the backend. No other pod needs cache access.
+# Redis has no authentication in the base config (requirepass is not set);
+# the NetworkPolicy is the primary access control here until you add AUTH.
+#
+# To add Redis AUTH, set requirepass in the redis deployment command args and
+# update REDIS_URL to redis://:<password>@redis:6379/0
+
+# ── Ingress to redis ──────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-ingress
+  namespace: production
+  labels:
+    app.kubernetes.io/component: redis
+    app.kubernetes.io/part-of: django-react
+spec:
+  podSelector:
+    matchLabels:
+      app: redis
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: backend  # Only backend pods can connect to Redis
+      ports:
+        - port: 6379
+          protocol: TCP
+
+---
+# ── Egress from redis ─────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-egress
+  namespace: production
+  labels:
+    app.kubernetes.io/component: redis
+    app.kubernetes.io/part-of: django-react
+spec:
+  podSelector:
+    matchLabels:
+      app: redis
+  policyTypes:
+    - Egress
+  egress:
+    # DNS only
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP

@@ -1,0 +1,77 @@
+# values-production.yaml — Production overrides.
+#
+# Usage:
+#   helm upgrade --install django-react ./k8s/helm/django-react \
+#     -f k8s/helm/django-react/values-production.yaml \
+#     --set global.image.registry=myacr.azurecr.io \
+#     --set backend.image.tag=$(git rev-parse --short HEAD) \
+#     --set frontend.image.tag=$(git rev-parse --short HEAD) \
+#     --set secrets.djangoSecretKey=$DJANGO_SECRET_KEY \
+#     --set secrets.databaseUrl=$DATABASE_URL \
+#     --set secrets.redisUrl=$REDIS_URL \
+#     --set secrets.postgresUser=$POSTGRES_USER \
+#     --set secrets.postgresPassword=$POSTGRES_PASSWORD \
+#     --set secrets.postgresDb=$POSTGRES_DB \
+#     -n production --create-namespace \
+#     --atomic --timeout 5m \
+#     --history-max 5
+
+global:
+  environment: production
+  domain: 127.0.0.1.nip.io
+
+backend:
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+  hpa:
+    minReplicas: 2
+    maxReplicas: 10
+    cpuUtilization: 60
+    memoryUtilization: 70
+
+frontend:
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "250m"
+      memory: "256Mi"
+  hpa:
+    minReplicas: 2
+    maxReplicas: 10
+
+db:
+  enabled: true
+  persistence:
+    size: 20Gi
+    storageClass: managed-premium
+
+redis:
+  enabled: true
+  maxmemory: "400mb"
+  persistence:
+    enabled: true
+    size: 5Gi
+
+ingress:
+  tls:
+    certManager:
+      issuer: letsencrypt-production # Real certs for production
+
+networkPolicies:
+  enabled: true
+  defaultDeny: true
+
+hooks:
+  dbMigrate:
+    enabled: true
+    backoffLimit: 3
+    activeDeadlineSeconds: 300

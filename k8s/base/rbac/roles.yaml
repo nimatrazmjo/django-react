@@ -1,0 +1,121 @@
+# rbac/roles.yaml
+#
+# Role is namespace-scoped: permissions granted here only apply inside
+# the "production" namespace. Use ClusterRole (clusterroles.yaml) for
+# cluster-scoped resources (Nodes, PersistentVolumes, StorageClasses).
+#
+# Rule of thumb for this project:
+#   - Most components: no API access needed → empty Role or no Role at all
+#   - Migration job: needs to read Secrets (for DATABASE_URL) if not using envFrom
+#   - CI/CD pipeline SA (external): needs get/list/patch on Deployments + Jobs
+#
+# Every role listed here follows the audit trail:
+#   kubectl auth can-i --list --as=system:serviceaccount:production:<sa-name> -n production
+
+# ── Backend reader role ───────────────────────────────────────────────────────
+# Allows the backend SA to read ConfigMaps and Secrets directly from the API
+# if the app ever needs to hot-reload config without a pod restart.
+# Not needed when using envFrom (Kubernetes injects at pod start) — kept here
+# as a template to enable live config reloading if you add it later.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: backend-reader
+  namespace: production
+  labels:
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: django-react
+rules:
+  # Read-only access to ConfigMaps in this namespace.
+  # Needed only if the app calls the k8s API to read config.
+  # Remove this rule if the app relies solely on envFrom injection.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["app-config"]  # Scoped to the specific ConfigMap — not all configmaps.
+    verbs: ["get", "watch"]
+
+  # Read Secret to allow app-level secret rotation without restarting pods.
+  # This is the minimum for a secrets-reader pattern.
+  # If you use the CSI Secrets Store driver (Azure Key Vault), remove this rule.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["app-secrets"]  # Never grant access to all secrets — always name them.
+    verbs: ["get"]
+
+---
+# ── Migration job role ────────────────────────────────────────────────────────
+# The migration Job needs to read Secrets to build its DATABASE_URL.
+# It does NOT need write access to anything.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: migration-reader
+  namespace: production
+  labels:
+    app.kubernetes.io/component: migration
+    app.kubernetes.io/part-of: django-react
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["app-secrets"]
+    verbs: ["get"]
+
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["app-config"]
+    verbs: ["get"]
+
+---
+# ── CI/CD deployer role ───────────────────────────────────────────────────────
+# Used by the GitHub Actions service account (external CI SA) to apply manifests.
+# Deliberately minimal — only what `kubectl apply` and `kubectl rollout` need.
+# The CI SA is created separately in your cluster (not via this repo) and bound
+# to this Role via a RoleBinding in rolebindings.yaml.
+#
+# What's NOT here by design:
+#   - No delete on Deployments (use drain/cordon, not delete)
+#   - No access to Secrets (CI injects secret values via --set, not --from-file)
+#   - No ClusterRole escalation
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cicd-deployer
+  namespace: production
+  labels:
+    app.kubernetes.io/component: cicd
+    app.kubernetes.io/part-of: django-react
+rules:
+  # kubectl apply -k / helm upgrade need these to create/update workloads
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+  # kubectl rollout status / rollout undo
+  - apiGroups: ["apps"]
+    resources: ["deployments/status", "deployments/scale"]
+    verbs: ["get", "update", "patch"]
+
+  # Helm needs to read/write its own release ConfigMap or Secret
+  - apiGroups: [""]
+    resources: ["configmaps", "services", "serviceaccounts"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+  # Run migration Jobs pre-deploy
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+
+  # HPA updates during deploy (change replica count)
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+  # PDB reads during rollout safety checks
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+  # Ingress updates during deploy
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]

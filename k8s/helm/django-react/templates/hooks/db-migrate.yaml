@@ -1,0 +1,116 @@
+{{- if .Values.hooks.dbMigrate.enabled }}
+# hooks/db-migrate.yaml — Pre-upgrade Job that runs Django migrations.
+#
+# Helm hook lifecycle:
+#   helm upgrade is called
+#   → Helm runs pre-upgrade hooks (this Job) and WAITS for them to complete
+#   → If the Job succeeds (exit 0): Helm proceeds to apply the new templates
+#   → If the Job fails (non-zero exit after backoffLimit retries): Helm aborts
+#     the upgrade and reports an error. The old release stays running.
+#     This is the critical safety net: a failed migration blocks a bad deploy.
+#
+# Why pre-upgrade (not pre-install)?
+#   On the first install (helm install) there's no existing app to protect.
+#   On upgrades (helm upgrade) migrations must run BEFORE new app pods come up,
+#   because new code may depend on the new schema. Running them after would
+#   cause the new pods to fail with "column does not exist" errors.
+#
+# Migration safety:
+#   Django's migration system is designed to be zero-downtime:
+#   - Migrations run while OLD pods are still serving traffic
+#   - Old code must be compatible with the new schema (additive changes only)
+#   - Destructive schema changes (dropping columns) require multi-step deploys:
+#     Step 1: Deploy code that no longer READS the column (schema change pending)
+#     Step 2: Deploy migration that drops the column
+#     This ensures old pods never break on the new schema.
+#
+# How to debug a failed migration:
+#   kubectl get jobs -n production
+#   kubectl logs job/db-migrate-<release-name> -n production
+#   # Fix the migration, then re-run: helm upgrade ...
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migrate-{{ .Release.Name }}
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "django-react.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migration
+    app: migration
+  annotations:
+    # Helm hook annotations — required for Helm to treat this as a hook.
+    "helm.sh/hook": pre-upgrade,post-install
+    # pre-upgrade: runs before new pods roll out on every `helm upgrade` — migrations before code.
+    # post-install: runs after all resources are created on first install — db pod exists and is ready.
+    # NOT pre-install: the db Deployment doesn't exist yet at that point, so the Job can't connect.
+    "helm.sh/hook-weight": "-5"   # Negative weight = runs BEFORE other hooks at same lifecycle event.
+                                   # Lower number = runs first. Use this to order multiple hooks.
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    # before-hook-creation: delete any previous Job of the same name before creating this one.
+    #   Without this, a second `helm upgrade` fails because the Job already exists.
+    # hook-succeeded: delete the Job after it succeeds to keep the namespace clean.
+    #   hook-failed is NOT in delete-policy: keeps failed Jobs for debugging.
+    #   kubectl get jobs -n production shows failed Jobs even after helm is done.
+spec:
+  backoffLimit: {{ .Values.hooks.dbMigrate.backoffLimit }}   # Retry the pod up to N times on failure.
+                                                              # Each retry creates a new pod — check logs on each.
+  activeDeadlineSeconds: {{ .Values.hooks.dbMigrate.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "django-react.labels" . | nindent 8 }}
+        app.kubernetes.io/component: migration
+        app: migration
+    spec:
+      serviceAccountName: migration-sa
+      {{- include "django-react.securityContext" . | nindent 6 }}
+      {{- include "django-react.imagePullSecrets" . | nindent 6 }}
+      restartPolicy: Never   # Never restart the pod — Helm handles retries via backoffLimit.
+                             # OnFailure would restart the container in the SAME pod; we want
+                             # a fresh pod for each retry so logs are clean and isolated.
+
+      # Prefer running the migration on a different node than the running app pods
+      # to avoid resource contention during deploy.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 50
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: backend
+                topologyKey: kubernetes.io/hostname
+
+      containers:
+        - name: migrate
+          image: {{ include "django-react.image" (dict "image" .Values.backend.image "global" .Values.global) }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          command:
+            - python
+            - manage.py
+            - migrate
+            - --no-input   # Non-interactive — never prompt in CI/hooks
+            - --verbosity
+            - "2"          # Verbose output so you can see exactly which migrations ran
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secrets
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"
+          {{- include "django-react.containerSecurityContext" . | nindent 10 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+{{- end }}

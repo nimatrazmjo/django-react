@@ -1,0 +1,162 @@
+{{- if .Values.redis.enabled }}
+# ── Redis Deployment ──────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "django-react.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+    app: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  strategy:
+    type: Recreate   # Same as db: ReadWriteOnce PVC requires Recreate strategy
+  template:
+    metadata:
+      labels:
+        {{- include "django-react.labels" . | nindent 8 }}
+        app: redis
+        app.kubernetes.io/component: redis
+    spec:
+      serviceAccountName: redis-sa
+      securityContext:
+        runAsUser: 999     # redis user in official redis alpine image
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      {{- include "django-react.imagePullSecrets" . | nindent 6 }}
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: redis
+          image: {{ include "django-react.image" (dict "image" .Values.redis.image "global" .Values.global) }}
+          imagePullPolicy: IfNotPresent
+          command:
+            - redis-server
+            - --maxmemory
+            - {{ .Values.redis.maxmemory | quote }}
+            - --maxmemory-policy
+            - {{ .Values.redis.maxmemoryPolicy | quote }}
+            {{- if .Values.redis.persistence.enabled }}
+            - --appendonly
+            - "yes"
+            - --appendfsync
+            - "everysec"
+            - --dir
+            - /data
+            {{- end }}
+          ports:
+            - name: redis
+              containerPort: {{ .Values.redis.service.port }}
+              protocol: TCP
+          readinessProbe:
+            exec:
+              command:
+                - redis-cli
+                - ping
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command:
+                - redis-cli
+                - ping
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            failureThreshold: 3
+            timeoutSeconds: 3
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 999
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            {{- if .Values.redis.persistence.enabled }}
+            - name: redis-data
+              mountPath: /data
+            {{- end }}
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        {{- if .Values.redis.persistence.enabled }}
+        - name: redis-data
+          persistentVolumeClaim:
+            claimName: redis-data
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+
+---
+{{- if .Values.redis.persistence.enabled }}
+# ── Redis PVC ─────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-data
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "django-react.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: {{ .Values.redis.persistence.storageClass }}
+  resources:
+    requests:
+      storage: {{ .Values.redis.persistence.size }}
+---
+{{- end }}
+
+# ── Redis Service ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "django-react.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  type: {{ .Values.redis.service.type }}
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: {{ .Values.redis.service.port }}
+      targetPort: {{ .Values.redis.service.port }}
+      protocol: TCP
+
+---
+# ── Redis PodDisruptionBudget ─────────────────────────────────────────────────
+{{- if .Values.redis.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: redis-pdb
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "django-react.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  maxUnavailable: {{ .Values.redis.pdb.maxUnavailable }}
+  selector:
+    matchLabels:
+      app: redis
+{{- end }}
+
+{{- end }}

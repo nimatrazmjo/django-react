@@ -1,0 +1,105 @@
+{{- if .Values.hooks.smokeTest.enabled }}
+# hooks/smoke-test.yaml — Helm test that validates the deployment after install/upgrade.
+#
+# This is a Helm TEST (not a pre/post hook) — it runs on demand:
+#   helm test django-react -n production
+#   helm test django-react -n production --logs   # Shows test pod output
+#
+# It is NOT run automatically as part of helm upgrade. Wire it into your CI pipeline
+# after a successful helm upgrade to gate on a live endpoint check:
+#
+#   helm upgrade --install django-react ... --atomic --timeout 5m
+#   helm test django-react -n production --timeout 2m
+#   # If test fails, rollback manually: helm rollback django-react -n production
+#
+# What the test checks:
+#   1. /api/health/ returns 200 (backend up, DB connected)
+#   2. /         returns 200 (frontend up)
+#   3. /api/ping/ returns 200 with {"pong": true} body (basic API sanity check)
+#
+# The test pod runs curl inside the cluster against the ClusterIP Services
+# (not the Ingress), so it validates the app layer independent of DNS/TLS.
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "django-react.fullname" . }}-smoke-test
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "django-react.labels" . | nindent 4 }}
+    app.kubernetes.io/component: smoke-test
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  serviceAccountName: migration-sa   # Reuse migration SA (no API access needed for curl)
+  {{- include "django-react.imagePullSecrets" . | nindent 2 }}
+  restartPolicy: Never
+  containers:
+    - name: smoke-test
+      image: curlimages/curl:8.5.0   # Minimal curl image — no shell, just curl
+      imagePullPolicy: IfNotPresent
+      command:
+        - /bin/sh
+        - -c
+        - |
+          set -e   # Exit immediately on any failure
+
+          echo "=== Smoke test starting ==="
+          echo "Target: backend:{{ .Values.backend.service.port }}, frontend:{{ .Values.frontend.service.port }}"
+
+          # ── Test 1: Backend health check ─────────────────────────────────
+          echo "--- Test 1: Backend health endpoint ---"
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 10 \
+            --retry 5 \
+            --retry-delay 3 \
+            --retry-connrefused \
+            http://backend:{{ .Values.backend.service.port }}/api/health/)
+          if [ "$STATUS" != "200" ]; then
+            echo "FAIL: /api/health/ returned HTTP $STATUS (expected 200)"
+            exit 1
+          fi
+          echo "PASS: /api/health/ returned 200"
+
+          # ── Test 2: Backend ping (JSON response validation) ───────────────
+          echo "--- Test 2: Backend API ping ---"
+          BODY=$(curl -s --max-time 10 \
+            http://backend:{{ .Values.backend.service.port }}/api/ping/)
+          echo "Response: $BODY"
+          if ! echo "$BODY" | grep -q '"pong"'; then
+            echo "FAIL: /api/ping/ did not return expected JSON"
+            exit 1
+          fi
+          echo "PASS: /api/ping/ returned expected body"
+
+          # ── Test 3: Frontend health check ─────────────────────────────────
+          echo "--- Test 3: Frontend health endpoint ---"
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 10 \
+            --retry 3 \
+            --retry-delay 2 \
+            http://frontend:{{ .Values.frontend.service.port }}/health)
+          if [ "$STATUS" != "200" ]; then
+            echo "FAIL: /health returned HTTP $STATUS (expected 200)"
+            exit 1
+          fi
+          echo "PASS: /health returned 200"
+
+          echo "=== All smoke tests passed ==="
+      resources:
+        requests:
+          cpu: "50m"
+          memory: "32Mi"
+        limits:
+          cpu: "100m"
+          memory: "64Mi"
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
+        runAsUser: 65534   # nobody
+        capabilities:
+          drop:
+            - ALL
+{{- end }}

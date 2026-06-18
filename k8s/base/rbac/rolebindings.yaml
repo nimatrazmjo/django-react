@@ -1,0 +1,107 @@
+# rbac/rolebindings.yaml
+#
+# RoleBindings grant a Role or ClusterRole to a subject (ServiceAccount, User, Group)
+# within a specific namespace. Nothing in this file grants cluster-wide access.
+#
+# Pattern: RoleBinding → Role (namespace-scoped permissions in ONE namespace)
+#          RoleBinding → ClusterRole (same, but reuses a ClusterRole definition)
+#
+# Verify any binding after apply:
+#   kubectl auth can-i get secrets --as=system:serviceaccount:production:backend-sa -n production
+#   kubectl auth can-i get nodes --as=system:serviceaccount:production:backend-sa
+#   # Should return "no" for cluster-scoped resources — confirms namespace isolation.
+
+# ── Backend SA → backend-reader Role ─────────────────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: backend-reader-binding
+  namespace: production
+  labels:
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: django-react
+subjects:
+  - kind: ServiceAccount
+    name: backend-sa          # Must match serviceaccounts.yaml
+    namespace: production     # Always explicit — prevents cross-namespace confusion
+roleRef:
+  kind: Role
+  name: backend-reader        # Must match roles.yaml
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ── Migration SA → migration-reader Role ─────────────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: migration-reader-binding
+  namespace: production
+  labels:
+    app.kubernetes.io/component: migration
+    app.kubernetes.io/part-of: django-react
+subjects:
+  - kind: ServiceAccount
+    name: migration-sa
+    namespace: production
+roleRef:
+  kind: Role
+  name: migration-reader
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ── CI/CD SA → cicd-deployer Role ────────────────────────────────────────────
+# The CI service account is created externally (in your pipeline bootstrap),
+# not by this repo. Update the name below to match the SA your CI creates.
+#
+# For GitHub Actions OIDC (recommended over static credentials):
+#   1. Enable OIDC on the AKS cluster
+#   2. Create a Kubernetes SA "github-actions-sa" in this namespace
+#   3. Annotate it with azure.workload.identity/client-id
+#   4. The GitHub Actions workflow uses the OIDC token to get cluster credentials
+#   No static kubeconfig secret needed — safer and auto-rotating.
+#
+# Alternative (static kubeconfig — simpler but lower security):
+#   kubectl create sa cicd-sa -n production
+#   # Then store the generated token in GitHub Secrets as KUBECONFIG
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cicd-deployer-binding
+  namespace: production
+  labels:
+    app.kubernetes.io/component: cicd
+    app.kubernetes.io/part-of: django-react
+subjects:
+  - kind: ServiceAccount
+    name: github-actions-sa   # Change to your actual CI service account name
+    namespace: production
+roleRef:
+  kind: Role
+  name: cicd-deployer
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ── CI/CD SA → django-react-namespace-deployer (ClusterRole via RoleBinding) ─
+# Grants the same CI SA the reusable ClusterRole, scoped to this namespace only.
+# This supplements cicd-deployer with StatefulSet + cert-manager permissions
+# defined in the ClusterRole but constrained to the "production" namespace.
+#
+# IMPORTANT: Using a RoleBinding here (not ClusterRoleBinding) means the
+# ClusterRole's permissions are ONLY active in the production namespace,
+# even though the ClusterRole itself is cluster-scoped. This is intentional.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cicd-namespace-deployer-binding
+  namespace: production
+  labels:
+    app.kubernetes.io/component: cicd
+    app.kubernetes.io/part-of: django-react
+subjects:
+  - kind: ServiceAccount
+    name: github-actions-sa
+    namespace: production
+roleRef:
+  kind: ClusterRole
+  name: django-react-namespace-deployer   # ClusterRole referenced via RoleBinding
+  apiGroup: rbac.authorization.k8s.io

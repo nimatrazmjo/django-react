@@ -1,0 +1,70 @@
+# rbac/clusterrolebindings.yaml
+#
+# ClusterRoleBindings grant permissions CLUSTER-WIDE.
+# Use these sparingly — most permissions should be namespace-scoped (RoleBindings).
+#
+# What legitimately needs cluster-wide access in this project:
+#   - CI SA reading PersistentVolumes (cluster-scoped resource, no namespace)
+#   - CI SA reading StorageClasses (cluster-scoped)
+#   - External monitoring SA reading nodes
+#
+# What does NOT need cluster-wide access:
+#   - Backend, frontend, db, redis pods — they never touch the API server at runtime
+#   - The migration Job — only needs Secrets/ConfigMaps in one namespace
+#
+# Audit existing ClusterRoleBindings before adding new ones:
+#   kubectl get clusterrolebindings -l app.kubernetes.io/part-of=django-react
+
+# ── CI SA → PV reader (cluster-scoped) ───────────────────────────────────────
+# PersistentVolumes are not namespaced, so this must be a ClusterRoleBinding.
+# Grants only read access to PVs and StorageClasses — not write.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: django-react-cicd-pv-reader
+  labels:
+    app.kubernetes.io/component: cicd
+    app.kubernetes.io/part-of: django-react
+subjects:
+  - kind: ServiceAccount
+    name: github-actions-sa     # CI SA — update to match your actual SA name
+    namespace: production       # Even in a CRB, specify the namespace for the SA
+roleRef:
+  kind: ClusterRole
+  name: django-react-pv-reader
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ── CI SA → Ingress reader (cluster-scoped read) ─────────────────────────────
+# Allows CI to read IngressClass resources (cluster-scoped) when validating
+# that the nginx IngressClass exists before creating Ingress objects.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: django-react-cicd-ingress-reader
+  labels:
+    app.kubernetes.io/component: cicd
+    app.kubernetes.io/part-of: django-react
+subjects:
+  - kind: ServiceAccount
+    name: github-actions-sa
+    namespace: production
+roleRef:
+  kind: ClusterRole
+  name: django-react-ingress-reader
+  apiGroup: rbac.authorization.k8s.io
+
+# ─────────────────────────────────────────────────────────────────────────────
+# What's intentionally NOT here:
+#
+# cluster-admin binding → Never. Not even for CI. If Helm or kubectl needs it,
+#   that's a sign the chart needs restructuring. Use per-resource Roles instead.
+#
+# view ClusterRole binding → The built-in "view" ClusterRole is too broad.
+#   It grants read access to all resources in ALL namespaces, which violates
+#   least-privilege when staging and production share a cluster.
+#
+# Node reader for backend/frontend → App pods never need to inspect nodes.
+#   If you're doing affinity/anti-affinity, that's declared in the PodSpec,
+#   and the scheduler handles it — the pod doesn't need API access to nodes.
+# ─────────────────────────────────────────────────────────────────────────────

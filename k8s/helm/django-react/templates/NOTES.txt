@@ -1,0 +1,51 @@
+django-react has been deployed!
+
+Release: {{ .Release.Name }}
+Namespace: {{ .Values.global.namespace }}
+Domain: https://{{ .Values.global.domain }}
+Environment: {{ .Values.global.environment }}
+
+═══════════════════════════════════════════════════════
+  VERIFY THE DEPLOYMENT
+═══════════════════════════════════════════════════════
+
+1. Check all pods are Running:
+   kubectl get pods -n {{ .Values.global.namespace }}
+
+2. Check rollout status:
+   kubectl rollout status deployment/backend -n {{ .Values.global.namespace }}
+   kubectl rollout status deployment/frontend -n {{ .Values.global.namespace }}
+
+3. Run smoke tests (validates live endpoints):
+   helm test {{ .Release.Name }} -n {{ .Values.global.namespace }} --logs
+
+4. Check TLS certificate status:
+   kubectl describe certificate myapp-tls -n {{ .Values.global.namespace }}
+   kubectl describe certificaterequest -n {{ .Values.global.namespace }}
+
+5. Check HPA status:
+   kubectl get hpa -n {{ .Values.global.namespace }}
+
+6. Verify PDB blocks disruptive operations:
+   kubectl get pdb -n {{ .Values.global.namespace }}
+
+═══════════════════════════════════════════════════════
+  FIRST-TIME SETUP (if DNS not pointed yet)
+═══════════════════════════════════════════════════════
+
+Get the Ingress public IP:
+  kubectl get svc ingress-nginx-controller -n ingress-nginx
+
+Point your DNS:
+  {{ .Values.global.domain }}     A  <EXTERNAL-IP>
+  www.{{ .Values.global.domain }} A  <EXTERNAL-IP>
+
+Wait for cert-manager to issue the TLS cert (usually < 2 minutes after DNS propagates):
+  kubectl get certificate -n {{ .Values.global.namespace }} -w
+
+═══════════════════════════════════════════════════════
+  ROLLBACK
+═══════════════════════════════════════════════════════
+
+  helm rollback {{ .Release.Name }} -n {{ .Values.global.namespace }}
+  helm history {{ .Release.Name }} -n {{ .Values.global.namespace }}

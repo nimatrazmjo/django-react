@@ -1,0 +1,122 @@
+# pdb/poddisruptionbudgets.yaml
+#
+# A PodDisruptionBudget (PDB) tells Kubernetes the minimum number of pods
+# that must remain available during VOLUNTARY disruptions:
+#   - kubectl drain (node maintenance, cluster upgrades)
+#   - Cluster autoscaler scale-down
+#   - Rolling updates initiated by a Deployment
+#
+# PDBs do NOT protect against involuntary disruptions (node crashes, OOMKill).
+# They only constrain what the control plane is allowed to do intentionally.
+#
+# Key fields:
+#   minAvailable: N  — at least N pods must remain running. If N pods can't be
+#                      kept up during a drain, the drain is blocked.
+#   maxUnavailable: N — at most N pods may be unavailable at once.
+#   selector        — matches pods by label (same selector as the Deployment).
+#
+# Rule of thumb:
+#   - Stateless (backend, frontend): minAvailable: 1 (always keep one pod serving)
+#   - Stateful, single replica (db, redis): maxUnavailable: 0 only if you
+#     accept that node drains will BLOCK until the pod is rescheduled. This is
+#     usually the right call for a primary database pod.
+#   - If you ever move db/redis to a managed service (RDS, ElastiCache), delete
+#     those PDBs — the managed service handles its own HA.
+#
+# Verify a PDB is working:
+#   kubectl get pdb -n production
+#   # Shows ALLOWED DISRUPTIONS column — if it's 0, you can't drain any node
+#   # without the drain hanging. This is expected for db/redis when replicas=1.
+
+# ── Backend PDB ───────────────────────────────────────────────────────────────
+# With 2 replicas and minAvailable: 1, Kubernetes can take down 1 pod at a time.
+# During a cluster upgrade (node drain), it drains one node, the backend pod on
+# that node is evicted, the remaining pod (on a different node) keeps serving.
+# The evicted pod is rescheduled on a different node before the next one is drained.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: backend-pdb
+  namespace: production
+  labels:
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: django-react
+spec:
+  minAvailable: 1           # At least 1 backend pod must be running at all times.
+                            # With HPA minReplicas: 2, this allows 1 pod to be evicted.
+                            # With 3+ replicas (peak load), it allows N-1 to be evicted simultaneously.
+                            # Change to "50%" to always allow half the pods to be disrupted.
+  selector:
+    matchLabels:
+      app: backend
+
+---
+# ── Frontend PDB ──────────────────────────────────────────────────────────────
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: frontend-pdb
+  namespace: production
+  labels:
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/part-of: django-react
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: frontend
+
+---
+# ── PostgreSQL PDB ────────────────────────────────────────────────────────────
+# maxUnavailable: 0 means NO voluntary disruptions are allowed when exactly 1
+# replica is running. kubectl drain will BLOCK on this node until either:
+#   a) The pod is rescheduled on a different node (happens automatically if
+#      another schedulable node exists)
+#   b) You run: kubectl drain --ignore-daemonsets --delete-emptydir-data --force
+#      (the --force flag bypasses the PDB — only for emergency maintenance)
+#
+# Why not minAvailable: 1 instead?
+#   minAvailable: 1 with replicas=1 is identical — you still can't drain.
+#   maxUnavailable: 0 is explicit and more readable for stateful single-replica pods.
+#
+# For a production database, NEVER run with replicas=1 in a real setup.
+# Use Azure Database for PostgreSQL (managed), or run a primary + replica StatefulSet.
+# This config supports the current in-cluster single-node Postgres as documented.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: db-pdb
+  namespace: production
+  labels:
+    app.kubernetes.io/component: db
+    app.kubernetes.io/part-of: django-react
+spec:
+  maxUnavailable: 0         # Zero voluntary disruptions allowed.
+                            # Node drain will block until the pod reschedules.
+                            # This is correct for a single-replica stateful pod.
+  selector:
+    matchLabels:
+      app: db
+
+---
+# ── Redis PDB ─────────────────────────────────────────────────────────────────
+# Same pattern as db: single replica, maxUnavailable: 0.
+# Redis is less critical than the DB (cache miss → backend falls through to DB)
+# but losing Redis during peak load causes a cache stampede, which can overwhelm
+# the DB. Keeping it up through node drains prevents that scenario.
+#
+# If you add Redis Sentinel or Redis Cluster later, change maxUnavailable
+# to N-1 where N is the number of replicas (maintain quorum).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: redis-pdb
+  namespace: production
+  labels:
+    app.kubernetes.io/component: redis
+    app.kubernetes.io/part-of: django-react
+spec:
+  maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: redis

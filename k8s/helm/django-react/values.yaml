@@ -1,0 +1,304 @@
+# values.yaml — Default values for the django-react Helm chart.
+#
+# Override hierarchy (last wins):
+#   values.yaml  <  values-staging.yaml  <  --set key=value (CLI)
+#
+# Usage:
+#   helm install django-react ./k8s/helm/django-react \
+#     -f k8s/helm/django-react/values-production.yaml \
+#     --set global.image.registry=myacr.azurecr.io \
+#     --set backend.image.tag=abc1234 \
+#     --set frontend.image.tag=abc1234 \
+#     -n production --create-namespace
+#
+# Sensitive values (DATABASE_URL, DJANGO_SECRET_KEY) are NOT in this file.
+# Pass them via: --set secrets.djangoSecretKey=... or via a Kubernetes Secret
+# pre-created in the namespace (recommended for production).
+
+# ── Global ────────────────────────────────────────────────────────────────────
+global:
+  # Docker registry prefix applied to all image.repository values.
+  # Set to your ACR: myacr.azurecr.io
+  # Leave empty to use images without a registry prefix (e.g., public Docker Hub).
+  image:
+    registry: ""
+    pullPolicy: Always
+    pullSecrets:
+      - name:
+          acr-secret # Created separately:
+          # kubectl create secret docker-registry acr-secret \
+          #   --docker-server=<ACR>.azurecr.io \
+          #   --docker-username=<SP_CLIENT_ID> \
+          #   --docker-password=<SP_CLIENT_SECRET> \
+          #   -n production
+
+  # Target namespace — all namespaced resources land here.
+  namespace: production
+
+  # Public-facing domain. Used in Ingress host and CORS config.
+  domain: 127.0.0.1.nip.io
+
+  # Environment label added to all pod labels for observability.
+  environment: production
+
+# ── RBAC ──────────────────────────────────────────────────────────────────────
+rbac:
+  # Set to false to skip all ServiceAccount, Role, and Binding creation.
+  # Do this if your cluster admin manages RBAC separately.
+  create: true
+
+  # Name of the external CI/CD ServiceAccount that gets the deployer RoleBinding.
+  cicdServiceAccountName: github-actions-sa
+
+# ── Backend (Django / Gunicorn) ───────────────────────────────────────────────
+backend:
+  replicaCount: 2
+
+  image:
+    repository: backend # Prefixed with global.image.registry at render time.
+    tag: latest # Overridden per-deploy by CI: --set backend.image.tag=$(git rev-parse --short HEAD)
+
+  service:
+    type: ClusterIP
+    port: 8000
+
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    cpuUtilization: 60 # Scale up when average CPU > 60%
+    memoryUtilization: 70 # Scale up when average memory > 70%
+
+  pdb:
+    enabled: true
+    minAvailable: 1 # Always keep at least 1 pod during node drains
+
+  # Extra environment variables added to the backend deployment.
+  # Non-sensitive only — put secrets in the secrets section below.
+  extraEnv: []
+  # - name: GUNICORN_WORKERS
+  #   value: "4"
+
+  # Liveness / readiness probe paths. Override if your health endpoint differs.
+  probes:
+    liveness:
+      path: /api/health/
+      initialDelaySeconds: 30
+      periodSeconds: 15
+      failureThreshold: 3
+      timeoutSeconds: 3
+    readiness:
+      path: /api/health/
+      initialDelaySeconds: 20
+      periodSeconds: 10
+      failureThreshold: 3
+      timeoutSeconds: 5
+
+  # Node affinity: prefer spreading backend pods across availability zones.
+  # Set to false to disable (useful in single-zone dev clusters).
+  topologySpreadEnabled: true
+
+# ── Frontend (nginx + React) ──────────────────────────────────────────────────
+frontend:
+  replicaCount: 2
+
+  image:
+    repository: frontend
+    tag: latest
+
+  service:
+    type: ClusterIP
+    port: 80
+
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "250m"
+      memory: "256Mi"
+
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    cpuUtilization: 60
+    memoryUtilization: 70
+
+  pdb:
+    enabled: true
+    minAvailable: 1
+
+  probes:
+    liveness:
+      path: /health
+      initialDelaySeconds: 10
+      periodSeconds: 15
+      failureThreshold: 3
+      timeoutSeconds: 3
+    readiness:
+      path: /health
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      failureThreshold: 3
+      timeoutSeconds: 3
+
+# ── PostgreSQL ────────────────────────────────────────────────────────────────
+db:
+  # Set enabled: false if using Azure Database for PostgreSQL (recommended for prod).
+  # Update secrets.databaseUrl to point to the managed service endpoint.
+  enabled: true
+
+  image:
+    repository: postgres
+    tag: "16-alpine"
+
+  service:
+    type: ClusterIP
+    port: 5432
+
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+  persistence:
+    enabled: true # Set to false to use emptyDir (local dev only — no data survives pod restarts).
+    storageClass: managed-premium # From storage/storageclass.yaml
+    size: 20Gi
+    # reclaimPolicy is set on the StorageClass, not the PVC.
+    # The StorageClass sets Retain, so the disk survives PVC deletion.
+
+  # Pod-level security context for the postgres container.
+  # fsGroup: 999 lets Kubernetes pre-set volume ownership to the postgres user.
+  # On AKS (Azure managed disks) this works fine.
+  # On local hostpath (Docker Desktop / kind), Kubernetes can't chown the hostpath
+  # directory → postgres crashes on init. Set to {} in values-local.yaml.
+  podSecurityContext:
+    fsGroup: 999
+    seccompProfile:
+      type: RuntimeDefault
+
+  pdb:
+    enabled: true
+    maxUnavailable: 0 # Block node drains that would evict the only DB pod.
+
+# ── Redis ─────────────────────────────────────────────────────────────────────
+redis:
+  # Set enabled: false if using Azure Cache for Redis.
+  enabled: true
+
+  image:
+    repository: redis
+    tag: "7-alpine"
+
+  service:
+    type: ClusterIP
+    port: 6379
+
+  maxmemory: "400mb"
+  maxmemoryPolicy:
+    "allkeys-lru" # Evict least-recently-used keys when maxmemory is hit.
+    # Other options: volatile-lru (only keys with TTL),
+    # noeviction (return error instead of evicting — risky for cache).
+
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "250m"
+      memory: "512Mi"
+
+  persistence:
+    enabled: true # Set to false for cache-only (faster, no disk cost).
+    storageClass: managed-standard-ssd
+    size: 5Gi
+
+  pdb:
+    enabled: true
+    maxUnavailable: 0
+
+# ── Ingress ───────────────────────────────────────────────────────────────────
+ingress:
+  enabled: true
+  className: nginx
+
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: "/$2"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-body-size: "20m"
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    nginx.ingress.kubernetes.io/limit-connections: "20"
+
+  tls:
+    enabled: true
+    secretName: myapp-tls
+    certManager:
+      enabled: true
+      issuer: letsencrypt-production # Switch to letsencrypt-staging for initial testing
+
+# ── cert-manager ClusterIssuers ───────────────────────────────────────────────
+certManager:
+  # Set to true to create ClusterIssuer resources via this chart.
+  # Set to false if ClusterIssuers are managed at the cluster level (typical for shared clusters).
+  createIssuers: true
+  email: admin@127.0.0.1.nip.io # Let's Encrypt expiry notification email
+
+# ── Network Policies ──────────────────────────────────────────────────────────
+networkPolicies:
+  enabled:
+    true # Set to false in clusters without a CNI that enforces NetworkPolicy.
+    # AKS with Azure CNI + Calico: set true.
+    # AKS with Azure CNI only: set false (not enforced — waste of time).
+  defaultDeny: true # Creates the default-deny-ingress + default-deny-egress policies.
+
+# ── StorageClasses ────────────────────────────────────────────────────────────
+storageClasses:
+  # Set to false if the StorageClasses already exist in the cluster
+  # (e.g., managed-premium is a built-in AKS class).
+  create: true
+
+# ── Secrets ───────────────────────────────────────────────────────────────────
+# These values are empty by default — you MUST provide them at deploy time.
+# Recommended: use --set on the CLI (value is not stored in the chart) or
+# pre-create the Secret manually and set createSecret: false.
+#
+# NEVER commit real values to this file or to any values-*.yaml file.
+secrets:
+  # When false, the chart expects a pre-existing Secret named "app-secrets"
+  # with the keys below. Use this in production with Azure Key Vault + CSI driver.
+  create: true
+
+  djangoSecretKey: "" # --set secrets.djangoSecretKey=$(openssl rand -hex 50)
+  databaseUrl: "" # --set secrets.databaseUrl="postgres://user:pass@db:5432/myapp"
+  redisUrl: "" # --set secrets.redisUrl="redis://redis:6379/0"
+  postgresUser: "" # --set secrets.postgresUser=postgres
+  postgresPassword: "" # --set secrets.postgresPassword=$(openssl rand -hex 16)
+  postgresDb: "" # --set secrets.postgresDb=myapp_prod
+
+# ── Hooks ─────────────────────────────────────────────────────────────────────
+hooks:
+  dbMigrate:
+    enabled: true # Runs `python manage.py migrate` as a pre-upgrade Job.
+    backoffLimit: 3 # Retry migration Job up to 3 times before failing the deploy.
+    activeDeadlineSeconds: 300 # Fail if migrations take > 5 minutes.
+
+  smokeTest:
+    enabled: true # Runs a Helm test that checks the /api/health/ endpoint.
+    # Run after deploy: helm test django-react -n production

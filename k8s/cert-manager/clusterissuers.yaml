@@ -1,0 +1,98 @@
+# cert-manager/clusterissuers.yaml
+#
+# ClusterIssuers are the cert-manager objects that know HOW to obtain certificates.
+# They're cluster-scoped (not namespaced), so any namespace can reference them.
+#
+# We define TWO issuers:
+#   1. letsencrypt-staging  — use during initial setup and testing.
+#      Let's Encrypt staging has much higher rate limits and produces untrusted
+#      certs (the browser will show a warning). Safe to hammer during debugging.
+#   2. letsencrypt-production — use once staging works end-to-end.
+#      Real trusted certs. Rate limit: 5 certs per registered domain per week.
+#      If you burn through these during debugging, you'll be blocked for a week.
+#
+# Workflow:
+#   1. Deploy with issuerRef: letsencrypt-staging → verify cert-manager creates
+#      the Certificate resource and the TLS secret appears in the namespace.
+#   2. Curl the endpoint and confirm the 403 cert error (expected from staging CA).
+#   3. Swap issuerRef in ingress.yaml to letsencrypt-production → apply.
+#   4. Cert-manager replaces the secret with a trusted cert automatically.
+#
+# Prerequisites — install cert-manager before applying this file:
+#   helm repo add jetstack https://charts.jetstack.io
+#   helm install cert-manager jetstack/cert-manager \
+#     --namespace cert-manager \
+#     --create-namespace \
+#     --version v1.14.0 \
+#     --set installCRDs=true
+#
+# Verify cert-manager is running:
+#   kubectl get pods -n cert-manager
+#   kubectl get crds | grep cert-manager
+#
+# How Let's Encrypt HTTP-01 challenge works:
+#   cert-manager creates a temporary Ingress route for /.well-known/acme-challenge/<token>
+#   Let's Encrypt hits that URL from the internet to verify domain ownership.
+#   This requires the Ingress to have a real public IP and DNS pointed at it BEFORE
+#   you apply this issuer and the TLS Ingress. If DNS isn't set yet, use DNS-01 instead.
+#
+# How to switch to DNS-01 (works before DNS cutover, required for wildcard certs):
+#   Replace the http01 block with:
+#     dns01:
+#       azureDNS:
+#         subscriptionID: "<AZURE_SUBSCRIPTION_ID>"
+#         resourceGroupName: "<DNS_ZONE_RESOURCE_GROUP>"
+#         hostedZoneName: "127.0.0.1.nip.io"
+#         environment: AzurePublicCloud
+#         managedIdentity:
+#           clientID: "<MANAGED_IDENTITY_CLIENT_ID>"
+
+# ── Staging issuer (test with this first) ─────────────────────────────────────
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+  labels:
+    app.kubernetes.io/part-of: django-react
+    cert-manager.io/environment: staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email:
+      admin@127.0.0.1.nip.io # Replace with your actual email.
+      # Let's Encrypt sends expiry warnings here.
+      # Must be a real address you monitor.
+    privateKeySecretRef:
+      name:
+        letsencrypt-staging-account-key # cert-manager creates this automatically.
+        # Stores your ACME account private key.
+        # Do not delete it — cert-manager uses it
+        # to authenticate future renewal requests.
+    solvers:
+      - http01:
+          ingress:
+            class:
+              nginx # Must match the IngressClass of your ingress controller.
+              # Check: kubectl get ingressclass
+              # If using ingressClassName: nginx in the Ingress spec,
+              # change this to: ingressClassName: nginx
+
+---
+# ── Production issuer (use after staging works) ────────────────────────────────
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-production
+  labels:
+    app.kubernetes.io/part-of: django-react
+    cert-manager.io/environment: production
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory # Real LE API — rate limited
+    email: admin@127.0.0.1.nip.io # Same as staging. Replace with your email.
+    privateKeySecretRef:
+      name: letsencrypt-production-account-key # Separate key from staging account.
+    solvers:
+      - http01:
+          ingress:
+            class: nginx

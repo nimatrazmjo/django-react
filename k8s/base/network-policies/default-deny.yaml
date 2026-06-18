@@ -1,0 +1,68 @@
+# network-policies/default-deny.yaml
+#
+# This is the most important NetworkPolicy in the entire cluster for this namespace.
+# It establishes a "zero-trust" baseline: deny everything, then allow explicitly.
+#
+# Without this policy, ALL pods in the namespace can talk to each other freely —
+# a compromised frontend pod could directly query the database on port 5432.
+#
+# How NetworkPolicies work:
+#   - They are additive: multiple policies are OR'd together. A packet is allowed
+#     if ANY policy permits it.
+#   - A pod with NO NetworkPolicy is fully open (allow all).
+#   - A pod with ANY NetworkPolicy is implicitly deny-all for the traffic direction
+#     covered by that policy, then the rules open specific holes.
+#   - Ingress and egress are controlled independently.
+#
+# This policy has an empty podSelector (matches ALL pods in the namespace) and
+# empty ingress/egress rules (zero allow rules), making it an explicit deny-all.
+# Each component then gets its own NetworkPolicy that opens only what it needs.
+#
+# Prerequisites:
+#   Your AKS cluster must use the Azure CNI with Calico network policy, or
+#   a CNI plugin that supports NetworkPolicy (Calico, Cilium, Antrea).
+#   Azure CNI alone (without Calico) does NOT enforce NetworkPolicies.
+#
+#   Enable during AKS cluster creation:
+#     az aks create --network-plugin azure --network-policy calico ...
+#   Or use Cilium (preferred for full L7 visibility):
+#     az aks create --network-plugin azure --network-plugin-mode overlay --network-policy cilium ...
+#
+# Verify enforcement after apply:
+#   kubectl exec -it <backend-pod> -n production -- nc -zv db 5432
+#   # Should FAIL until network-policies/db.yaml is applied.
+
+# ── Deny all ingress for all pods ────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: production
+  labels:
+    app.kubernetes.io/part-of: django-react
+    policy-type: baseline
+spec:
+  podSelector: {}       # Empty selector = matches ALL pods in namespace
+  policyTypes:
+    - Ingress           # This policy covers ingress direction only
+  # No ingress rules = deny all ingress
+
+---
+# ── Deny all egress for all pods ─────────────────────────────────────────────
+# Blocks outbound traffic from ALL pods by default.
+# This prevents a compromised pod from calling out to attacker infrastructure.
+# DNS (port 53) is re-opened in each component's NetworkPolicy — without it
+# pods can't resolve service names and everything breaks.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: production
+  labels:
+    app.kubernetes.io/part-of: django-react
+    policy-type: baseline
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  # No egress rules = deny all egress

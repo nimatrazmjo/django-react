@@ -1,5 +1,5 @@
 # docker-compose.prod.yml — OVERRIDES for production
-version: '3.9'
+version: "3.9"
 
 services:
   backend:
@@ -22,7 +22,7 @@ services:
       dockerfile: frontend/Dockerfile
       target: production
       args:
-        VITE_API_URL: https://myapp.com
+        VITE_API_URL: https://127.0.0.1.nip.io
         VITE_ENV: production
     volumes: []
     env_file:
@@ -37,7 +37,7 @@ services:
       - "443:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf
-      - /etc/letsencrypt:/etc/letsencrypt:ro   # SSL certs
+      - /etc/letsencrypt:/etc/letsencrypt:ro # SSL certs
     depends_on:
       - backend
       - frontend

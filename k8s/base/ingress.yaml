@@ -1,108 +1,159 @@
-# ingress.yaml — Single public entry point that routes traffic to internal services.
+# ingress.yaml — Single public entry point with TLS termination via cert-manager.
 #
-# What this file does:
-#   An Ingress is a cluster-level routing layer that sits in front of all your
-#   ClusterIP Services. It receives traffic on a single public IP (provisioned
-#   by the nginx ingress controller) and routes requests to the correct internal
-#   Service based on the URL path or hostname.
-#
-#   This is why individual Services in this project do NOT use type: LoadBalancer.
-#   One Ingress = one public Azure Load Balancer = one public IP = lower cost.
-#   Each additional LoadBalancer-type Service would provision a separate Azure LB
-#   and a separate public IP, which adds unnecessary cost and complexity.
-#
-# Routing in this file:
-#   /api/*  → backend Service (Django REST API on port 8000)
-#   /*      → frontend Service (nginx serving React static files on port 80)
-#
-#   Note: The frontend nginx.conf also has a proxy_pass for /api/ to the backend
-#   ClusterIP service. That path is still valid and acts as a fallback, but the
-#   Ingress-level routing is the authoritative path in Kubernetes.
+# Traffic flow:
+#   Browser → DNS → Azure Load Balancer (nginx ingress controller)
+#           → TLS termination (cert-manager-issued Let's Encrypt cert)
+#           → /api/* → backend Service (Django, port 8000)
+#           → /*     → frontend Service (nginx, port 80)
 #
 # Prerequisites:
-#   The nginx ingress controller must be installed in your AKS cluster:
-#   helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
-#   helm install ingress-nginx ingress-nginx/ingress-nginx --namespace ingress-nginx --create-namespace
+#   1. nginx ingress controller:
+#      helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+#      helm install ingress-nginx ingress-nginx/ingress-nginx \
+#        --namespace ingress-nginx --create-namespace \
+#        --set controller.service.annotations."service\.beta\.kubernetes\.io/azure-load-balancer-health-probe-request-path"=/healthz
 #
-# How to apply:
-#   kubectl apply -f k8s/ingress.yaml
+#   2. cert-manager:
+#      helm repo add jetstack https://charts.jetstack.io
+#      helm install cert-manager jetstack/cert-manager \
+#        --namespace cert-manager --create-namespace \
+#        --version v1.14.0 --set installCRDs=true
 #
-# How to verify:
-#   kubectl get ingress -n production
-#   # Look for an ADDRESS — this is the public IP. It may take 1-2 minutes to appear.
-#   kubectl describe ingress app-ingress -n production
+#   3. ClusterIssuer (k8s/cert-manager/clusterissuers.yaml must be applied first)
+#
+#   4. DNS: 127.0.0.1.nip.io A record → ingress controller external IP
+#      kubectl get svc -n ingress-nginx ingress-nginx-controller
+#      # Copy EXTERNAL-IP, add it as an A record in your DNS provider
+#
+# Cert lifecycle:
+#   - cert-manager watches this Ingress for the cert-manager.io/cluster-issuer annotation.
+#   - It creates a Certificate resource automatically, requests it from Let's Encrypt,
+#     and stores the issued cert in the Secret named in spec.tls[].secretName.
+#   - 30 days before expiry, cert-manager renews automatically (no manual intervention).
+#   - Check cert status: kubectl describe certificate myapp-tls -n production
+#
+# HTTPS redirect:
+#   ssl-redirect: "true" tells nginx to 301-redirect all HTTP traffic to HTTPS.
+#   force-ssl-redirect: "true" enforces this even if X-Forwarded-Proto is set.
+#   Both are set here. Remove them only for local testing without TLS.
 
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: app-ingress
   namespace: production
+  labels:
+    app.kubernetes.io/part-of: django-react
   annotations:
-    # Tells Kubernetes which ingress controller should handle this resource.
-    # Must match the class of the nginx ingress controller you installed.
+    # ── Ingress controller ─────────────────────────────────────────────────────
+    # Use ingressClassName in spec (preferred over this annotation in k8s 1.18+).
+    # Kept here for compatibility with older ingress-nginx chart versions.
     kubernetes.io/ingress.class: "nginx"
 
-    # Strip the /api prefix before forwarding to the backend.
-    # Without this, Django would receive /api/users/ and would need to match
-    # that full path in urls.py. With rewrite, it receives /users/ instead.
-    # If your urls.py already includes the /api prefix, remove this annotation.
+    # ── cert-manager TLS ───────────────────────────────────────────────────────
+    # Tells cert-manager which ClusterIssuer to use for this Ingress.
+    # Start with letsencrypt-staging, switch to letsencrypt-production once verified.
+    # cert-manager creates the Secret (myapp-tls) and keeps it renewed automatically.
+    cert-manager.io/cluster-issuer: "letsencrypt-production"
+
+    # ── HTTPS enforcement ──────────────────────────────────────────────────────
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+
+    # ── Path rewriting ─────────────────────────────────────────────────────────
+    # Strips the /api prefix: /api/users/ → /users/ before reaching Django.
+    # If your urls.py mounts routes under /api/, remove this annotation and
+    # simplify the path below to just /api/.
     nginx.ingress.kubernetes.io/rewrite-target: "/$2"
 
-    # Increase proxy timeouts for long-running API requests (e.g. report generation).
-    # Default is 60s. 120s matches the gunicorn --timeout in the backend Dockerfile.
-    # If users report gateway timeouts on slow endpoints, increase this value.
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"    # seconds before nginx gives up waiting for backend
-    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"  # seconds to establish connection to backend
+    # ── Timeouts ──────────────────────────────────────────────────────────────
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
 
-    # Increase max request body size for file uploads.
-    # Default nginx limit is 1MB. 20MB covers most document/image uploads.
-    # If users upload larger files, increase this. Match it in gunicorn settings too.
+    # ── Upload size limit ──────────────────────────────────────────────────────
     nginx.ingress.kubernetes.io/proxy-body-size: "20m"
 
+    # ── Security headers ───────────────────────────────────────────────────────
+    # These are injected by nginx into every response. Equivalent to adding them
+    # in Django's SECURE_HEADERS or in the frontend nginx.conf, but applied at
+    # the edge so they cover both backend and frontend traffic uniformly.
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      more_set_headers "Strict-Transport-Security: max-age=31536000; includeSubDomains; preload";
+      more_set_headers "X-Content-Type-Options: nosniff";
+      more_set_headers "X-Frame-Options: DENY";
+      more_set_headers "Referrer-Policy: strict-origin-when-cross-origin";
+      more_set_headers "Permissions-Policy: camera=(), microphone=(), geolocation=()";
+
+    # ── Rate limiting ──────────────────────────────────────────────────────────
+    # Limit: 100 requests per minute per IP on API paths.
+    # Burst: allows a burst of up to 20 requests before rate limiting kicks in.
+    # Adjust nginx.ingress.kubernetes.io/limit-rps for your traffic profile.
+    # Apply only to the API path — frontend static files don't need rate limiting.
+    # To scope this to /api only, split the Ingress into two objects (api-ingress + frontend-ingress).
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    nginx.ingress.kubernetes.io/limit-connections: "20"
+
 spec:
+  # ingressClassName is the k8s 1.18+ way to specify the controller.
+  # This AND the annotation above are set for maximum compatibility.
+  ingressClassName: nginx
+
+  # ── TLS ───────────────────────────────────────────────────────────────────────
+  # cert-manager watches for this block. It creates a Certificate resource and
+  # stores the issued cert + key in the named Secret. The Secret is mounted by
+  # the nginx ingress controller to terminate TLS.
+  tls:
+    - hosts:
+        - 127.0.0.1.nip.io # Must exactly match spec.rules[].host below.
+        - www.127.0.0.1.nip.io # Add subdomains here if needed.
+          # cert-manager requests a SAN cert covering all listed hostnames.
+      secretName:
+        myapp-tls # cert-manager will CREATE this Secret.
+        # Do not create it manually — cert-manager manages it.
+        # If the Secret already exists, cert-manager will update it on renewal.
+
   rules:
-    - host: myapp.com  # Replace with your actual domain.
-                       # To test before DNS is configured, you can omit this field
-                       # (routes all hostnames) or use the raw IP address.
+    # ── www redirect ──────────────────────────────────────────────────────────
+    # If you want www.127.0.0.1.nip.io to redirect to 127.0.0.1.nip.io, add a separate Ingress
+    # with permanent-redirect annotation instead of routing it here.
+
+    - host: 127.0.0.1.nip.io
       http:
         paths:
-          # ── API traffic ───────────────────────────────────────────────────────
+          # ── API routes ─────────────────────────────────────────────────────
+          # Regex path with two capture groups for the rewrite-target annotation.
+          # /api/users/ → nginx rewrites to /users/ → backend receives /users/
+          # pathType must be ImplementationSpecific when using regex paths.
           - path: /api(/|$)(.*)
-            # Matches any path starting with /api/ or exactly /api.
-            # The rewrite-target annotation above rewrites /api/users/ → /users/
-            # before it reaches Django. Adjust if your url patterns differ.
-            pathType: Prefix
+            pathType: ImplementationSpecific
             backend:
               service:
-                name: backend      # The ClusterIP Service for the Django backend.
+                name: backend
                 port:
-                  number: 8000     # Gunicorn listens on port 8000 inside the pod.
+                  number: 8000
 
-          # ── Frontend / catch-all ──────────────────────────────────────────────
+          # ── Frontend / SPA catch-all ───────────────────────────────────────
+          # All non-API paths serve the React app.
+          # The frontend nginx container handles try_files → index.html fallback
+          # for client-side routing (React Router).
           - path: /
-            # Matches everything not already matched by /api.
-            # The frontend nginx container handles SPA routing internally:
-            # any path that is not a real file falls back to index.html,
-            # which lets React Router handle client-side navigation.
             pathType: Prefix
             backend:
               service:
-                name: frontend     # The ClusterIP Service for the React frontend.
+                name: frontend
                 port:
-                  number: 80       # nginx inside the frontend pod listens on port 80.
+                  number: 80
 
-# ── TLS / HTTPS ─────────────────────────────────────────────────────────────
-# Uncomment and configure cert-manager to enable HTTPS.
-# Do not go to production without enabling this section.
-#
-# Prerequisites:
-#   1. Install cert-manager: https://cert-manager.io/docs/installation/
-#   2. Create a ClusterIssuer for Let's Encrypt (see cert-manager docs)
-#   3. Uncomment the tls block below and replace the host/secret name
-#
-#  tls:
-#    - hosts:
-#        - myapp.com          # Must match the host in spec.rules above
-#      secretName: myapp-tls  # cert-manager will create this Secret automatically
-#                             # once the ClusterIssuer is configured and DNS is pointed
-#                             # at the ingress IP address.
+    # www subdomain — routes to frontend (no API on www).
+    # Remove if you don't use www.127.0.0.1.nip.io.
+    - host: www.127.0.0.1.nip.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80

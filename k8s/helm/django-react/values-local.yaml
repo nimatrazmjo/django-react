@@ -1,0 +1,135 @@
+# values-local.yaml — Local Kubernetes overrides (Docker Desktop / kind / minikube).
+#
+# What this changes from defaults:
+#   - No ACR registry — images are built locally and loaded directly into the cluster
+#   - No TLS — cert-manager and Let's Encrypt require a public domain
+#   - No NetworkPolicy enforcement — Docker Desktop's CNI doesn't enforce them
+#                                   (kind with Calico/Cilium does — set enabled: true there)
+#   - StorageClass: built-in hostpath (Docker Desktop) or standard (kind/minikube)
+#   - 1 replica everywhere — saves memory on a dev laptop
+#   - HPA disabled — metrics-server not installed by default locally
+#   - Lower resource limits — leaves room for other local processes
+#
+# ── Docker Desktop (recommended for simplicity) ───────────────────────────────
+# Usage:
+#   helm upgrade --install django-react ./k8s/helm/django-react \
+#     -f k8s/helm/django-react/values-local.yaml \
+#     --set backend.image.tag=local \
+#     --set frontend.image.tag=local \
+#     --set secrets.djangoSecretKey=local-dev-secret-key \
+#     --set secrets.databaseUrl="postgres://postgres:postgres@db:5432/myapp_local" \
+#     --set secrets.redisUrl="redis://redis:6379/0" \
+#     --set secrets.postgresUser=postgres \
+#     --set secrets.postgresPassword=postgres \
+#     --set secrets.postgresDb=myapp_local \
+#     -n local --create-namespace
+#
+# ── kind ──────────────────────────────────────────────────────────────────────
+# Same command, but add: --set db.persistence.storageClass=standard
+#                        --set networkPolicies.enabled=true  (if using Calico/Cilium)
+
+global:
+  namespace: local
+  environment: dev
+  domain: localhost
+
+  image:
+    registry: ""            # No registry prefix — images are named backend:local, frontend:local
+    pullPolicy: Never       # Never try to pull — images must already be loaded into the cluster
+    pullSecrets: []         # No ACR credentials needed
+
+rbac:
+  create: true
+  cicdServiceAccountName: default   # Use the default SA locally — no CI SA exists
+
+backend:
+  replicaCount: 1
+  allowedHosts: "*"
+  image:
+    repository: backend
+    tag: local
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "250m"
+      memory: "256Mi"
+  hpa:
+    enabled: false   # metrics-server not installed by default — HPA will stay in Unknown state
+  topologySpreadEnabled: false   # Single node locally — topology spread will block scheduling
+
+frontend:
+  replicaCount: 1
+  image:
+    repository: frontend
+    tag: local
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "100m"
+      memory: "128Mi"
+  hpa:
+    enabled: false
+  topologySpreadEnabled: false
+
+db:
+  enabled: true
+  podSecurityContext: {}   # No fsGroup/runAsUser — let postgres init as root then drop via gosu.
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "250m"
+      memory: "256Mi"
+  persistence:
+    enabled: false   # Use emptyDir locally. Hostpath volumes on Docker Desktop/kind have chown
+                     # restrictions that block postgres init even when the container runs as root
+                     # (CAP_CHOWN is restricted by the container runtime on hostpath mounts).
+                     # Data resets on pod restart — acceptable for local k8s testing.
+
+redis:
+  enabled: true
+  maxmemory: "64mb"
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "100m"
+      memory: "128Mi"
+  persistence:
+    enabled: false   # No persistence needed locally — just a cache
+
+ingress:
+  enabled: true
+  tls:
+    enabled: false   # No cert-manager or public domain locally
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/rewrite-target: "/$2"
+    nginx.ingress.kubernetes.io/proxy-body-size: "20m"
+
+certManager:
+  createIssuers: false   # No public DNS — Let's Encrypt can't reach localhost
+
+networkPolicies:
+  enabled: false        # Docker Desktop CNI does not enforce NetworkPolicies.
+                        # Set to true when using kind with Calico or Cilium.
+  defaultDeny: false
+
+storageClasses:
+  create: false         # Use the cluster's built-in storage class (hostpath / standard).
+                        # The AKS-specific StorageClasses in storage/storageclass.yaml won't
+                        # provision volumes locally (disk.csi.azure.com doesn't exist).
+
+hooks:
+  dbMigrate:
+    enabled: true
+    activeDeadlineSeconds: 120
+  smokeTest:
+    enabled: true

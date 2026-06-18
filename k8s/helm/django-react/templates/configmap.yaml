@@ -1,0 +1,15 @@
+# ── ConfigMap ─────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "django-react.labels" . | nindent 4 }}
+data:
+  DJANGO_SETTINGS_MODULE: "config.settings.{{ .Values.global.environment }}"
+  DEBUG: "False"
+  ALLOWED_HOSTS: "{{ .Values.backend.allowedHosts | default (printf "%s,www.%s" .Values.global.domain .Values.global.domain) }}"
+  CORS_ALLOWED_ORIGINS: "https://{{ .Values.global.domain }}"
+  VITE_API_URL: "https://{{ .Values.global.domain }}"
+  VITE_ENV: {{ .Values.global.environment | quote }}

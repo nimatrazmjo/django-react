@@ -1,66 +1,72 @@
 # overlays/local/kustomization.yaml — Local development overlay for K8s testing.
 #
-# Purpose:
-#   Lets you test the full Kubernetes stack on a local cluster (minikube / kind / k3d)
-#   using images built and pushed to a local registry at localhost:5000.
+# Runs the full stack on a local cluster (Docker Desktop / kind / k3d / minikube).
+# Images are built locally and referenced without an ACR registry prefix.
 #
-# Prerequisites:
-#   1. A local K8s cluster with a registry reachable at localhost:5000.
-#      Quickstart options:
-#        minikube:  minikube start && minikube addons enable registry
-#        k3d:       k3d cluster create local --registry-create local-registry:localhost:5000
-#        kind:      kind create cluster  (use `kind load docker-image` instead of a registry)
+# ── Two ways to run locally ───────────────────────────────────────────────────
 #
-#   2. Build and push images to localhost:5000:
-#        docker build --target production -f frontend/Dockerfile \
-#          --build-arg VITE_API_URL=http://localhost \
-#          --build-arg VITE_ENV=development \
-#          -t localhost:5000/frontend:latest .
-#        docker push localhost:5000/frontend:latest
+#  Option A — Helm (recommended, more control):
+#    See k8s/helm/django-react/values-local.yaml for the full guide.
+#    helm upgrade --install django-react ./k8s/helm/django-react \
+#      -f k8s/helm/django-react/values-local.yaml ...
 #
-#        docker build --target production -f backend/Dockerfile \
-#          -t localhost:5000/backend:latest .
-#        docker push localhost:5000/backend:latest
+#  Option B — Kustomize (this file):
+#    kubectl apply -k k8s/overlays/local
 #
-# Deploy:
-#   kubectl apply -k k8s/overlays/local
+# ── Kustomize quickstart ──────────────────────────────────────────────────────
 #
-# Preview manifests without applying:
-#   kubectl kustomize k8s/overlays/local
+# 1. Start your local cluster (Docker Desktop → Settings → Kubernetes → Enable,
+#    or: kind create cluster --name local)
 #
-# Access after deploy (no Ingress controller needed locally):
-#   kubectl port-forward svc/frontend 8080:80 -n local
-#   kubectl port-forward svc/backend  8000:8000 -n local
+# 2. Build images:
+#    docker build --target production -f backend/Dockerfile  -t backend:local .
+#    docker build --target production -f frontend/Dockerfile \
+#      --build-arg VITE_API_URL=http://localhost \
+#      --build-arg VITE_ENV=development \
+#      -t frontend:local .
 #
-# Tear down:
-#   kubectl delete -k k8s/overlays/local
+#    For kind — load images into the cluster after building:
+#    kind load docker-image backend:local frontend:local --name local
+#
+# 3. Deploy:
+#    kubectl apply -k k8s/overlays/local
+#
+# 4. Access:
+#    Option A (with nginx ingress controller installed):
+#      kubectl get svc -n ingress-nginx   # get EXTERNAL-IP (127.0.0.1 on Docker Desktop)
+#      curl http://localhost/api/health/
+#
+#    Option B (port-forward, no ingress needed):
+#      kubectl port-forward svc/backend  8000:8000 -n local &
+#      kubectl port-forward svc/frontend 8080:80   -n local &
+#      curl http://localhost:8000/api/health/
+#      open http://localhost:8080
+#
+# 5. Tear down:
+#    kubectl delete -k k8s/overlays/local
 
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-# ── Namespace ──────────────────────────────────────────────────────────────────
 namespace: local
 
-# ── Base layer ─────────────────────────────────────────────────────────────────
 resources:
   - ../../base
 
 # ── Image overrides ────────────────────────────────────────────────────────────
-# Replaces the ACR image refs in every Deployment with localhost:5000 equivalents.
-# Kustomize matches on the image name field exactly as it appears in the base
-# deployment manifests — including the <ACR_NAME>.azurecr.io prefix.
+# Replaces ACR image refs with local names. The base deployments reference
+# <ACR_NAME>.azurecr.io/backend — replace both name and tag here.
 images:
-  - name: <ACR_NAME>.azurecr.io/frontend
-    newName: localhost:5000/frontend
-    newTag: latest
   - name: <ACR_NAME>.azurecr.io/backend
-    newName: localhost:5000/backend
-    newTag: latest
+    newName: backend
+    newTag: local
+  - name: <ACR_NAME>.azurecr.io/frontend
+    newName: frontend
+    newTag: local
 
-# ── Patches ────────────────────────────────────────────────────────────────────
 patches:
 
-  # ── Rename the Namespace resource ─────────────────────────────────────────────
+  # ── Namespace rename ────────────────────────────────────────────────────────
   - target:
       kind: Namespace
       name: production
@@ -69,7 +75,7 @@ patches:
         path: /metadata/name
         value: local
 
-  # ── ConfigMap — local settings ─────────────────────────────────────────────────
+  # ── ConfigMap — local settings ──────────────────────────────────────────────
   - target:
       kind: ConfigMap
       name: app-config
@@ -84,15 +90,14 @@ patches:
         ALLOWED_HOSTS: "localhost,127.0.0.1,backend"
         CORS_ALLOWED_ORIGINS: "http://localhost:8080,http://localhost"
         VITE_ENV: "development"
+        VITE_API_URL: "http://localhost"
 
-  # ── Secret — local dev values (not real secrets; safe to commit) ───────────────
-  # All values are base64-encoded plain-text dev credentials.
-  # Decode any value with: echo "<value>" | base64 -d
-  #   local-dev-secret-key      → DJANGO_SECRET_KEY
-  #   postgres://postgres:postgres@db:5432/myapp_local → DATABASE_URL
-  #   redis://redis:6379/0      → REDIS_URL
-  #   postgres                  → POSTGRES_USER / POSTGRES_PASSWORD
-  #   myapp_local               → POSTGRES_DB
+  # ── Secret — local dev values (safe to commit, not real secrets) ─────────────
+  # Decoded:
+  #   DJANGO_SECRET_KEY=local-dev-secret-key
+  #   DATABASE_URL=postgres://postgres:postgres@db:5432/myapp_local
+  #   REDIS_URL=redis://redis:6379/0
+  #   POSTGRES_USER=postgres  POSTGRES_PASSWORD=postgres  POSTGRES_DB=myapp_local
   - target:
       kind: Secret
       name: app-secrets
@@ -109,19 +114,43 @@ patches:
         POSTGRES_PASSWORD: cG9zdGdyZXM=
         POSTGRES_DB: bXlhcHBfbG9jYWw=
 
-  # ── Ingress — strip hostname so it responds to localhost ───────────────────────
-  # Removing the host field makes nginx-ingress accept requests for any hostname,
-  # including localhost and 127.0.0.1 — no DNS required.
-  # Only applies if you have an ingress controller installed locally.
-  # If not, use kubectl port-forward instead (see header above).
+  # ── Ingress — remove hostname + disable TLS ─────────────────────────────────
+  # Without a host field, nginx-ingress accepts requests for any hostname (including
+  # localhost). TLS is removed — no cert-manager or public DNS locally.
   - target:
       kind: Ingress
       name: app-ingress
     patch: |-
-      - op: remove
-        path: /spec/rules/0/host
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: app-ingress
+        annotations:
+          nginx.ingress.kubernetes.io/ssl-redirect: "false"
+          nginx.ingress.kubernetes.io/force-ssl-redirect: "false"
+          nginx.ingress.kubernetes.io/rewrite-target: "/$2"
+          nginx.ingress.kubernetes.io/proxy-body-size: "20m"
+      spec:
+        tls: null
+        rules:
+          - http:
+              paths:
+                - path: /api(/|$)(.*)
+                  pathType: ImplementationSpecific
+                  backend:
+                    service:
+                      name: backend
+                      port:
+                        number: 8000
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: frontend
+                      port:
+                        number: 80
 
-  # ── Backend Deployment ─────────────────────────────────────────────────────────
+  # ── Backend — 1 replica, no imagePullSecrets, lower resources ────────────────
   - target:
       kind: Deployment
       name: backend
@@ -136,24 +165,24 @@ patches:
           spec:
             containers:
               - name: backend
-                imagePullPolicy: IfNotPresent
+                imagePullPolicy: Never
                 resources:
                   requests:
                     cpu: "100m"
                     memory: "128Mi"
                   limits:
-                    cpu: "200m"
+                    cpu: "250m"
                     memory: "256Mi"
-
-  # imagePullSecrets must be removed via JSON 6902 — strategic merge cannot drop a list.
   - target:
       kind: Deployment
       name: backend
     patch: |-
       - op: remove
         path: /spec/template/spec/imagePullSecrets
+      - op: remove
+        path: /spec/template/spec/topologySpreadConstraints
 
-  # ── Frontend Deployment ────────────────────────────────────────────────────────
+  # ── Frontend — same ─────────────────────────────────────────────────────────
   - target:
       kind: Deployment
       name: frontend
@@ -168,7 +197,7 @@ patches:
           spec:
             containers:
               - name: frontend
-                imagePullPolicy: IfNotPresent
+                imagePullPolicy: Never
                 resources:
                   requests:
                     cpu: "50m"
@@ -176,15 +205,17 @@ patches:
                   limits:
                     cpu: "100m"
                     memory: "128Mi"
-
   - target:
       kind: Deployment
       name: frontend
     patch: |-
       - op: remove
         path: /spec/template/spec/imagePullSecrets
+      - op: remove
+        path: /spec/template/spec/topologySpreadConstraints
 
-  # ── PVC — swap AKS storage class for local hostpath ───────────────────────────
+  # ── Postgres PVC — use built-in local storage class ──────────────────────────
+  # Docker Desktop: hostpath  |  kind / minikube: standard
   - target:
       kind: PersistentVolumeClaim
       name: postgres-data
@@ -196,7 +227,51 @@ patches:
         path: /spec/resources/requests/storage
         value: 1Gi
 
-  # ── DB Deployment ──────────────────────────────────────────────────────────────
+  # ── Redis PVC — disable persistence locally (Redis is just a cache) ──────────
+  # Replace the PVC's storage class with hostpath and a tiny size.
+  # Alternatively, remove the volume entirely from the redis Deployment.
+  - target:
+      kind: PersistentVolumeClaim
+      name: redis-data
+    patch: |-
+      - op: replace
+        path: /spec/storageClassName
+        value: hostpath
+      - op: replace
+        path: /spec/resources/requests/storage
+        value: 256Mi
+
+  # ── Redis Deployment — disable AOF persistence locally ──────────────────────
+  - target:
+      kind: Deployment
+      name: redis
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: redis
+      spec:
+        template:
+          spec:
+            containers:
+              - name: redis
+                command:
+                  - redis-server
+                  - --maxmemory
+                  - 64mb
+                  - --maxmemory-policy
+                  - allkeys-lru
+                  - --save
+                  - ""
+                resources:
+                  requests:
+                    cpu: "50m"
+                    memory: "64Mi"
+                  limits:
+                    cpu: "100m"
+                    memory: "128Mi"
+
+  # ── DB Deployment — lower resources ─────────────────────────────────────────
   - target:
       kind: Deployment
       name: db
@@ -215,39 +290,10 @@ patches:
                     cpu: "100m"
                     memory: "128Mi"
                   limits:
-                    cpu: "200m"
+                    cpu: "250m"
                     memory: "256Mi"
 
-  # ── Redis Deployment ───────────────────────────────────────────────────────────
-  - target:
-      kind: Deployment
-      name: redis
-    patch: |-
-      apiVersion: apps/v1
-      kind: Deployment
-      metadata:
-        name: redis
-      spec:
-        template:
-          spec:
-            containers:
-              - name: redis
-                args:
-                  - "--maxmemory"
-                  - "100mb"
-                  - "--maxmemory-policy"
-                  - "allkeys-lru"
-                  - "--save"
-                  - ""
-                resources:
-                  requests:
-                    cpu: "50m"
-                    memory: "64Mi"
-                  limits:
-                    cpu: "100m"
-                    memory: "128Mi"
-
-  # ── Backend HPA — locked to 1 replica (no metrics-server needed locally) ───────
+  # ── HPAs — lock to 1 replica (no metrics-server by default locally) ──────────
   - target:
       kind: HorizontalPodAutoscaler
       name: backend-hpa
@@ -258,8 +304,6 @@ patches:
       - op: replace
         path: /spec/maxReplicas
         value: 1
-
-  # ── Frontend HPA — same lock ───────────────────────────────────────────────────
   - target:
       kind: HorizontalPodAutoscaler
       name: frontend-hpa
@@ -270,3 +314,53 @@ patches:
       - op: replace
         path: /spec/maxReplicas
         value: 1
+
+  # ── StorageClasses — replace AKS provisioner with local one ─────────────────
+  # disk.csi.azure.com doesn't exist on local clusters. Replace with a valid
+  # local provisioner so the resources apply cleanly.
+  # The actual PVCs above are patched to use hostpath/standard directly,
+  # so these StorageClasses are not used — but they must apply without error.
+  - target:
+      kind: StorageClass
+      name: managed-premium
+    patch: |-
+      - op: replace
+        path: /provisioner
+        value: docker.io/hostpath
+      - op: replace
+        path: /volumeBindingMode
+        value: Immediate
+      - op: replace
+        path: /parameters
+        value: {}
+  - target:
+      kind: StorageClass
+      name: managed-standard-ssd
+    patch: |-
+      - op: replace
+        path: /provisioner
+        value: docker.io/hostpath
+      - op: replace
+        path: /volumeBindingMode
+        value: Immediate
+      - op: replace
+        path: /parameters
+        value: {}
+
+  # ── RBAC — replace CI SA reference with default ─────────────────────────────
+  # github-actions-sa doesn't exist locally. Point the deployer binding at
+  # the default SA so it applies without error (has no real effect locally).
+  - target:
+      kind: RoleBinding
+      name: django-react-cicd-deployer
+    patch: |-
+      - op: replace
+        path: /subjects/0/name
+        value: default
+  - target:
+      kind: ClusterRoleBinding
+      name: django-react-cicd-pv-reader
+    patch: |-
+      - op: replace
+        path: /subjects/0/name
+        value: default

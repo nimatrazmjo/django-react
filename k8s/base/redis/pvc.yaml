@@ -1,0 +1,51 @@
+# redis/pvc.yaml — PersistentVolumeClaim for Redis AOF persistence.
+#
+# Redis in this project uses AOF (Append-Only File) persistence:
+#   appendonly yes  (in redis.conf or --appendonly yes command arg)
+#   appendfsync everysec  (flush to disk every second — balanced durability/performance)
+#
+# With AOF, Redis writes every command to the AOF file. On restart it replays
+# the file to rebuild state. You lose at most ~1 second of data on crash.
+#
+# Why persist Redis at all?
+#   Without persistence, a Redis pod restart clears the cache. Django falls
+#   through to the DB for every request until the cache warms up.
+#   For short restarts (pod reschedule) this is fine. For longer incidents
+#   (node replacement during an upgrade), a warm cache at restart prevents
+#   a DB stampede that can cascade into a full outage.
+#
+# Alternative — RDB snapshots (simpler):
+#   Replace AOF with: --save 60 1 --save 300 10
+#   Creates point-in-time snapshots. Less crash-safe than AOF but smaller files.
+#   Use for cache-only workloads where losing up to 5 minutes of cache is acceptable.
+#
+# If Redis is ONLY a cache (not a queue or session store), persistence is optional.
+# Delete this file and remove the volume mount from redis/deployment.yaml to run
+# Redis in-memory only (faster, simpler, zero disk cost).
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-data
+  namespace: production
+  labels:
+    app.kubernetes.io/component: redis
+    app.kubernetes.io/part-of: django-react
+  annotations:
+    helm.sh/resource-policy: keep
+    description: "Redis AOF persistence volume — stores command log for crash recovery"
+spec:
+  accessModes:
+    - ReadWriteOnce
+
+  storageClassName: managed-standard-ssd   # Standard SSD from storage/storageclass.yaml.
+                                           # Redis AOF is sequential writes — Standard SSD
+                                           # is cheaper than Premium and performs adequately.
+                                           # Switch to managed-premium only if Redis is used
+                                           # as a primary queue (Celery, RQ) under heavy load.
+  resources:
+    requests:
+      storage: 5Gi     # AOF files grow with write volume. For a cache-heavy workload
+                       # with moderate traffic, 5Gi is generous (AOF is auto-rewritten
+                       # when it grows too large: BGREWRITEAOF runs automatically).
+                       # Monitor: kubectl exec <redis-pod> -- redis-cli info persistence

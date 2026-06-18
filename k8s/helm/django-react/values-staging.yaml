@@ -1,0 +1,69 @@
+# values-staging.yaml — Staging overrides (lower resources, staging TLS cert).
+#
+# Usage:
+#   helm upgrade --install django-react-staging ./k8s/helm/django-react \
+#     -f k8s/helm/django-react/values-staging.yaml \
+#     --set global.image.registry=myacr.azurecr.io \
+#     --set backend.image.tag=$(git rev-parse --short HEAD) \
+#     --set frontend.image.tag=$(git rev-parse --short HEAD) \
+#     --set secrets.djangoSecretKey=$STAGING_SECRET_KEY \
+#     --set secrets.databaseUrl=$STAGING_DATABASE_URL \
+#     --set secrets.redisUrl=$STAGING_REDIS_URL \
+#     -n staging --create-namespace
+
+global:
+  namespace: staging
+  environment: staging
+  domain: staging.127.0.0.1.nip.io
+
+backend:
+  replicaCount: 1 # Single replica fine for staging — save node capacity
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "250m"
+      memory: "256Mi"
+  hpa:
+    minReplicas: 1
+    maxReplicas: 3
+    cpuUtilization: 80 # Less aggressive scaling in staging
+
+frontend:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "100m"
+      memory: "128Mi"
+  hpa:
+    minReplicas: 1
+    maxReplicas: 3
+
+db:
+  enabled: true
+  persistence:
+    size: 5Gi # Smaller disk for staging
+    storageClass: managed-standard-ssd # Cheaper class for non-prod
+
+redis:
+  maxmemory: "128mb"
+  persistence:
+    enabled: false # No persistence needed in staging
+
+ingress:
+  tls:
+    secretName: staging-myapp-tls
+    certManager:
+      issuer: letsencrypt-staging # Use staging cert (untrusted but unlimited rate)
+
+networkPolicies:
+  enabled: true # Test the same policies in staging to catch issues before prod
+
+hooks:
+  dbMigrate:
+    enabled: true
+    activeDeadlineSeconds: 600 # Longer timeout — staging may have slower nodes

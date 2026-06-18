@@ -29,34 +29,60 @@ kind: Kustomization
 
 resources:
   # ── Cluster-scoped ────────────────────────────────────────────────────────────
-  - namespace.yaml      # Creates the namespace. Name is overridden per overlay.
+  - namespace.yaml # Creates the namespace. Name is overridden per overlay.
 
   # ── Shared config ─────────────────────────────────────────────────────────────
-  - configmap.yaml      # Non-sensitive env vars (DJANGO_SETTINGS_MODULE, ALLOWED_HOSTS, etc.)
-  - secrets.yaml        # Secret placeholder template — real values injected before first deploy
+  - configmap.yaml # Non-sensitive env vars (DJANGO_SETTINGS_MODULE, ALLOWED_HOSTS, etc.)
+  - secrets.yaml # Secret placeholder template — real values injected before first deploy
 
   # ── Ingress ───────────────────────────────────────────────────────────────────
-  - ingress.yaml        # nginx ingress: routes /api/* → backend, /* → frontend
-                        # Note: the host field (myapp.com) should be patched per env
-                        # in each overlay if you use per-env subdomains.
+  - ingress.yaml # nginx ingress: routes /api/* → backend, /* → frontend
+    # Note: the host field (127.0.0.1.nip.io) should be patched per env
+    # in each overlay if you use per-env subdomains.
 
   # ── Backend (Django/Gunicorn) ─────────────────────────────────────────────────
-  - backend/deployment.yaml  # 2 replicas, gunicorn, probes on /api/health/
-  - backend/service.yaml     # ClusterIP, port 8000
-  - backend/hpa.yaml         # Autoscale 2–10 on CPU (60%) and memory (70%)
+  - backend/deployment.yaml # 2 replicas, gunicorn, probes on /api/health/
+  - backend/service.yaml # ClusterIP, port 8000
+  - backend/hpa.yaml # Autoscale 2–10 on CPU (60%) and memory (70%)
 
   # ── Frontend (nginx + React static files) ────────────────────────────────────
-  - frontend/deployment.yaml  # 2 replicas, nginx, probes on /health
-  - frontend/service.yaml     # ClusterIP, port 80
-  - frontend/hpa.yaml         # Autoscale 2–10 on CPU (60%) and memory (70%)
+  - frontend/deployment.yaml # 2 replicas, nginx, probes on /health
+  - frontend/service.yaml # ClusterIP, port 80
+  - frontend/hpa.yaml # Autoscale 2–10 on CPU (60%) and memory (70%)
 
   # ── PostgreSQL ────────────────────────────────────────────────────────────────
-  - db/pvc.yaml         # 20Gi Azure Premium SSD for postgres data
-  - db/deployment.yaml  # postgres:16-alpine, 1 replica (Recreate strategy)
-  - db/service.yaml     # ClusterIP, port 5432
-  - db/hpa.yaml         # Locked to 1 replica — signals CPU pressure, cannot scale out
+  - db/pvc.yaml # 20Gi Azure Premium SSD for postgres data
+  - db/deployment.yaml # postgres:16-alpine, 1 replica (Recreate strategy)
+  - db/service.yaml # ClusterIP, port 5432
+  - db/hpa.yaml # Locked to 1 replica — signals CPU pressure, cannot scale out
 
   # ── Redis ─────────────────────────────────────────────────────────────────────
-  - redis/deployment.yaml  # redis:7-alpine, 1 replica, maxmemory 400mb
-  - redis/service.yaml     # ClusterIP, port 6379
-  - redis/hpa.yaml         # Locked to 1 replica — signals memory pressure, cannot scale out
+  - redis/deployment.yaml # redis:7-alpine, 1 replica, maxmemory 400mb
+  - redis/service.yaml # ClusterIP, port 6379
+  - redis/hpa.yaml # Locked to 1 replica — signals memory pressure, cannot scale out
+  - redis/pvc.yaml # 5Gi Azure Standard SSD for Redis AOF persistence
+
+  # ── Storage ────────────────────────────────────────────────────────────────────
+  # StorageClasses are cluster-scoped. Apply once per cluster (not per env).
+  # If managed-premium already exists in your AKS cluster, skip this file.
+  - storage/storageclass.yaml # managed-premium (Premium SSD) + managed-standard-ssd
+
+  # ── RBAC ──────────────────────────────────────────────────────────────────────
+  - rbac/serviceaccounts.yaml # Per-component SAs, automountServiceAccountToken: false
+  - rbac/roles.yaml # backend-reader, migration-reader, cicd-deployer
+  - rbac/clusterroles.yaml # node-reader, pv-reader, ingress-reader, namespace-deployer
+  - rbac/rolebindings.yaml # Binds SAs to Roles within this namespace
+  - rbac/clusterrolebindings.yaml # CI SA → PV reader (cluster-scoped)
+
+  # ── Network Policies ───────────────────────────────────────────────────────────
+  # Requires a CNI that enforces NetworkPolicy: Calico, Cilium, or Antrea.
+  # AKS: enable with --network-policy calico or --network-policy cilium at cluster creation.
+  # Without enforcement, these policies are stored but have no effect.
+  - network-policies/default-deny.yaml # Zero-trust baseline: deny all ingress + egress
+  - network-policies/backend.yaml # backend ← ingress-ctrl; backend → db/redis/dns/443
+  - network-policies/frontend.yaml # frontend ← ingress-ctrl; frontend → dns
+  - network-policies/db.yaml # db ← backend+migration; db → dns
+  - network-policies/redis.yaml # redis ← backend; redis → dns
+
+  # ── Pod Disruption Budgets ─────────────────────────────────────────────────────
+  - pdb/poddisruptionbudgets.yaml # backend/frontend: minAvailable 1; db/redis: maxUnavailable 0

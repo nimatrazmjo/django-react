@@ -1,0 +1,173 @@
+{{- if .Values.db.enabled }}
+# ── PostgreSQL Deployment ─────────────────────────────────────────────────────
+# Single-replica stateful pod. For production HA, use Azure Database for PostgreSQL
+# Flexible Server instead (set db.enabled: false, update secrets.databaseUrl).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "django-react.labels" . | nindent 4 }}
+    app.kubernetes.io/component: db
+    app: db
+spec:
+  replicas: 1    # Hard-coded 1 — multiple PostgreSQL replicas on a single PVC = data corruption.
+  selector:
+    matchLabels:
+      app: db
+  strategy:
+    type: Recreate    # Recreate: stop old pod before starting new one.
+                      # Required for ReadWriteOnce volumes — only one pod can mount at a time.
+                      # Results in a brief downtime during DB pod updates (typically < 10s).
+                      # This is acceptable for single-replica Postgres.
+  template:
+    metadata:
+      labels:
+        {{- include "django-react.labels" . | nindent 8 }}
+        app: db
+        app.kubernetes.io/component: db
+    spec:
+      serviceAccountName: db-sa
+      {{- with .Values.db.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "django-react.imagePullSecrets" . | nindent 6 }}
+      terminationGracePeriodSeconds: 60   # Give postgres time to finish checkpointing before SIGKILL
+      containers:
+        - name: postgres
+          image: {{ include "django-react.image" (dict "image" .Values.db.image "global" .Values.global) }}
+          imagePullPolicy: IfNotPresent   # Don't re-pull stable postgres base images on every start
+          ports:
+            - name: postgres
+              containerPort: {{ .Values.db.service.port }}
+              protocol: TCP
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: POSTGRES_DB
+            # Tune shared_buffers to ~25% of container memory limit.
+            # 512Mi limit → 128MB shared_buffers.
+            # Override by adding POSTGRES_EXTRA_ARGS to extraEnv if needed.
+            - name: POSTGRES_EXTRA_ARGS
+              value: "-c shared_buffers=128MB -c max_connections=100 -c wal_level=replica"
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - $(POSTGRES_USER)
+                - -d
+                - $(POSTGRES_DB)
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - $(POSTGRES_USER)
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml .Values.db.resources | nindent 12 }}
+          securityContext:
+            # postgres image initialises as root then drops to uid 999 via gosu/su-exec.
+            # Do NOT set runAsNonRoot/runAsUser — that blocks the root init phase.
+            # Do NOT drop CAP_CHOWN/CAP_FOWNER — the init script needs them to chown
+            # the data directory to the postgres user before dropping privileges.
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+              {{- if .Values.db.persistence.enabled }}
+              subPath: pgdata   # subPath keeps postgres data isolated from PV root (AKS managed disks).
+              {{- end }}
+
+      volumes:
+        - name: postgres-data
+          {{- if .Values.db.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: postgres-data
+          {{- else }}
+          emptyDir: {}   # Local dev: no persistence needed. Avoids hostpath chown issues entirely.
+          {{- end }}
+
+{{- if .Values.db.persistence.enabled }}
+---
+# ── PostgreSQL PVC ────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "django-react.labels" . | nindent 4 }}
+    app.kubernetes.io/component: db
+  annotations:
+    helm.sh/resource-policy: keep   # Prevent helm uninstall from deleting the data disk
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: {{ .Values.db.persistence.storageClass }}
+  resources:
+    requests:
+      storage: {{ .Values.db.persistence.size }}
+{{- end }}
+
+---
+# ── PostgreSQL Service ────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "django-react.labels" . | nindent 4 }}
+    app.kubernetes.io/component: db
+spec:
+  type: {{ .Values.db.service.type }}
+  selector:
+    app: db
+  ports:
+    - name: postgres
+      port: {{ .Values.db.service.port }}
+      targetPort: {{ .Values.db.service.port }}
+      protocol: TCP
+
+---
+# ── PostgreSQL PodDisruptionBudget ────────────────────────────────────────────
+{{- if .Values.db.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: db-pdb
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "django-react.labels" . | nindent 4 }}
+    app.kubernetes.io/component: db
+spec:
+  maxUnavailable: {{ .Values.db.pdb.maxUnavailable }}
+  selector:
+    matchLabels:
+      app: db
+{{- end }}
+
+{{- end }}

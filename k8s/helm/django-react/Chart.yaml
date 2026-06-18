@@ -1,0 +1,39 @@
+apiVersion: v2
+name: django-react
+description: >
+  Production Helm chart for the Django REST + React full-stack application.
+  Covers backend (Gunicorn), frontend (nginx), PostgreSQL, Redis, nginx Ingress
+  with TLS, RBAC, NetworkPolicies, PodDisruptionBudgets, and StorageClasses.
+
+type: application
+version: 1.0.0          # Chart version — bump on every chart change (SemVer).
+appVersion: "1.0.0"     # Application version — updated by CI to match the git tag.
+
+keywords:
+  - django
+  - react
+  - postgres
+  - redis
+  - kubernetes
+
+maintainers:
+  - name: Nimat
+    email: nimat.razmjo@gmail.com
+
+# Chart dependencies — these are sub-charts pulled from external Helm repos.
+# To pull deps: helm dependency update k8s/helm/django-react
+# This chart does NOT include cert-manager or ingress-nginx as deps;
+# install those separately as cluster-level infrastructure (one per cluster,
+# shared across all apps). Only app-level dependencies live here.
+dependencies: []
+
+# Minimum Kubernetes version this chart requires.
+# NetworkPolicy + PodDisruptionBudget policy/v1 require k8s 1.21+.
+# Storage CSI params require AKS 1.21+ with disk.csi.azure.com provisioner.
+kubeVersion: ">=1.21.0-0"
+
+annotations:
+  # Used by Helm chart repositories for categorization.
+  category: Application
+  # Tracks which AKS feature flags this chart depends on.
+  aks.requirements: "calico-network-policy,disk-csi-driver,workload-identity"
