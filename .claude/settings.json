@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s \"https://api.github.com/repos/aquasecurity/trivy-action/git/refs/tags/v0.26.0\")",
+      "Bash(curl -s \"https://api.github.com/repos/gitleaks/gitleaks-action/git/refs/tags/v2.3.4\")",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git -C /Users/nimatullahrazmjo/workstation/dev-ops/django-react diff .github/workflows/build-manual.yaml)",
+      "Bash(git -C /Users/nimatullahrazmjo/workstation/dev-ops/django-react add .github/workflows/build-manual.yaml)",
+      "Bash(git -C /Users/nimatullahrazmjo/workstation/dev-ops/django-react commit -m ' *)"
+    ]
+  }
+}
