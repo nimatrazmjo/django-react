@@ -60,6 +60,7 @@ permissions:
   contents: read
   packages: read
   actions: read
+  security-events: write  # gitleaks-action v3 uploads SARIF to GitHub Security tab
 
 # ── Shared env ─────────────────────────────────────────────────────────────────
 env:
@@ -75,6 +76,7 @@ jobs:
       contents: read
       packages: read
       actions: read
+      security-events: write  # gitleaks-action v3 uploads SARIF to GitHub Security tab
 
     steps:
       # ── 0. Checkout ──────────────────────────────────────────────────────────
@@ -85,10 +87,10 @@ jobs:
 
       # ── 1. Secret scan ───────────────────────────────────────────────────────
       # Must run after checkout — gitleaks walks git history and requires .git.
-      # - name: Scan for secrets (gitleaks)
-      #   uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e  # v3.0.0
-      #   env:
-      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Scan for secrets (gitleaks)
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # ── 2. Resolve image tag ─────────────────────────────────────────────────
       - name: Resolve image tag
         id: tag
