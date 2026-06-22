@@ -7,6 +7,10 @@ FROM node:24-alpine AS base
 
 WORKDIR /app
 
+# Upgrade npm to patch CVE-2026-12151 (undici DoS via unbounded WebSocket memory growth).
+# The bundled undici in npm <10.9.3 is vulnerable; pin to a known-good version for reproducibility.
+RUN npm install -g npm@10.9.3
+
 # ================================
 # Stage 2: Dependencies
 # ================================
