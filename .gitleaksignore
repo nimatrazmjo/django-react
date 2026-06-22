@@ -1,0 +1,11 @@
+# .gitleaksignore
+#
+# Fingerprints for known false positives — intentional local-dev dummy values.
+# These base64 strings decode to literals like "local-dev-secret-key" and
+# "postgres". They are not real credentials.
+#
+# To add a new entry: copy the Fingerprint line from a gitleaks finding.
+
+# k8s/overlays/local/kustomization.yaml — commit d8a20ac (2026-06-16)
+d8a20acfa60e47e9d18e283d8bd8d3179a3e289b:k8s/overlays/local/kustomization.yaml:generic-api-key:105
+d8a20acfa60e47e9d18e283d8bd8d3179a3e289b:k8s/overlays/local/kustomization.yaml:kubernetes-secret-yaml:97

@@ -7,5 +7,12 @@ useDefault = true
 # k8s/overlays/local contains only documented local-dev dummy values.
 # The base64 strings decode to literals like "local-dev-secret-key" and
 # "postgres" — they are not real credentials and are safe to commit.
+# Historical commit fingerprints are suppressed via .gitleaksignore.
 description = "local k8s overlay dummy values"
 paths = ['''k8s/overlays/local/kustomization\.yaml''']
+regexes = [
+  # DJANGO_SECRET_KEY: local-dev-secret-key
+  '''bG9jYWwtZGV2LXNlY3JldC1rZXk=''',
+  # DATABASE_URL: postgres://postgres:postgres@db:5432/myapp_local
+  '''cG9zdGdyZXM6Ly9wb3N0Z3Jlczpwb3N0Z3Jlc0BkYjo1NDMyL215YXBwX2xvY2Fs''',
+]
