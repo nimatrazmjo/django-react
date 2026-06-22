@@ -70,13 +70,11 @@ jobs:
     name: "Build [${{ inputs.service }}] → [${{ inputs.environment }}]"
     runs-on: ubuntu-24.04
 
-    # cache: write allows docker-bake to populate the GHA layer cache
     permissions:
       id-token: write
       contents: read
       packages: read
       actions: read
-      cache: write
 
     steps:
       # ── 0. Secret scan ───────────────────────────────────────────────────────
