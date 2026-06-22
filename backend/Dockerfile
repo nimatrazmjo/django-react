@@ -42,7 +42,25 @@ ENTRYPOINT ["/entrypoint.sh"]
 CMD ["python", "manage.py", "runserver", "0.0.0.0:8000"]
 
 # ================================
-# Stage 4: Production
+# Stage 4: Staging
+# Same binary as production; env vars differ at runtime via .env.staging
+# ================================
+FROM dependencies AS staging
+
+COPY . .
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+RUN addgroup --system app && adduser --system --group app
+USER app
+
+EXPOSE 8000
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "2", "--timeout", "120"]
+
+# ================================
+# Stage 5: Production
 # ================================
 FROM dependencies AS production
 

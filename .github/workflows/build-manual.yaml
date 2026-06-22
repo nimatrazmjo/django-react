@@ -1,0 +1,154 @@
+# .github/workflows/build-manual.yaml
+#
+# Manual Docker image builder — triggered from the GitHub Actions UI.
+# Wraps docker-bake.hcl via the Makefile so the logic stays in one place.
+#
+# How to use:
+#   GitHub → Actions → "Manual: Build Docker Images" → Run workflow
+#   Pick: environment, service, tag, whether to push.
+#
+# Required secrets (same as deploy.yaml — no new secrets needed):
+#   AZURE_CLIENT_ID        — Azure AD app client ID for OIDC
+#   AZURE_TENANT_ID        — Azure AD tenant ID
+#   AZURE_SUBSCRIPTION_ID  — Azure subscription ID
+#   ACR_NAME               — ACR name without domain (e.g. "myapp")
+
+name: "Manual: Build Docker Images"
+
+on:
+  workflow_dispatch:
+    inputs:
+
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        default: staging
+        options:
+          - dev
+          - staging
+          - prod
+
+      service:
+        description: "Service to build (all = backend + frontend)"
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - backend
+          - frontend
+
+      tag:
+        description: "Image tag  (leave blank → short git SHA)"
+        required: false
+        type: string
+        default: ""
+
+      push:
+        description: "Push image to ACR after building?"
+        required: true
+        type: boolean
+        default: false
+
+# ── Permissions ────────────────────────────────────────────────────────────────
+# id-token: write  — needed to exchange a GitHub OIDC token for an Azure token.
+# contents: read   — needed to check out the repo.
+permissions:
+  id-token: write
+  contents: read
+
+# ── Shared env ─────────────────────────────────────────────────────────────────
+env:
+  ACR_LOGIN_SERVER: ${{ secrets.ACR_NAME }}.azurecr.io
+
+jobs:
+  build:
+    name: "Build [${{ inputs.service }}] → [${{ inputs.environment }}]"
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Resolve image tag ─────────────────────────────────────────────────
+      - name: Resolve image tag
+        id: tag
+        run: |
+          INPUT_TAG="${{ inputs.tag }}"
+          if [[ -n "$INPUT_TAG" ]]; then
+            echo "value=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
+          else
+            SHORT_SHA="${{ github.sha }}"
+            echo "value=${SHORT_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          fi
+        # Explicit tag wins; fall back to short SHA so every build is traceable.
+
+      # ── 3. Set up Docker Buildx ──────────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+          # docker-container driver is required for:
+          #   - multi-platform builds (--platform linux/amd64,linux/arm64)
+          #   - registry-backed layer cache (cache-from/cache-to in bake file)
+          # Without this, buildx falls back to the legacy builder that ignores
+          # the cache-from/cache-to directives in docker-bake.hcl.
+
+      # ── 4. Azure OIDC login ──────────────────────────────────────────────────
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        # Issues a short-lived token scoped to this repo + this run.
+        # No stored credential, nothing to rotate.
+
+      - name: Log in to Azure Container Registry
+        run: az acr login --name ${{ secrets.ACR_NAME }}
+        # Passes the Azure token from the step above to the Docker daemon so
+        # it can push to ACR. Equivalent to `docker login` but without a password.
+
+      # ── 5. Build (and optionally push) ──────────────────────────────────────
+      - name: Build images via docker-bake.hcl
+        env:
+          REGISTRY: ${{ env.ACR_LOGIN_SERVER }}
+          TAG: ${{ steps.tag.outputs.value }}
+          ENV: ${{ inputs.environment }}
+          SERVICE: ${{ inputs.service }}
+          PUSH: ${{ inputs.push }}
+        run: make build
+        # The Makefile resolves ENV + SERVICE → the right bake target and
+        # passes REGISTRY, TAG, and --push through to docker buildx bake.
+        # All build matrix logic lives in docker-bake.hcl — this step stays thin.
+
+      # ── 6. Summary ──────────────────────────────────────────────────────────
+      - name: Write job summary
+        if: always()
+        run: |
+          ENV="${{ inputs.environment }}"
+          SERVICE="${{ inputs.service }}"
+          TAG="${{ steps.tag.outputs.value }}"
+          PUSHED="${{ inputs.push }}"
+          REGISTRY="${{ env.ACR_LOGIN_SERVER }}"
+
+          {
+            echo "## Build summary"
+            echo ""
+            echo "| Field       | Value |"
+            echo "|-------------|-------|"
+            echo "| Environment | \`${ENV}\` |"
+            echo "| Service     | \`${SERVICE}\` |"
+            echo "| Tag         | \`${TAG}\` |"
+            echo "| Pushed      | ${PUSHED} |"
+            echo ""
+
+            if [[ "$SERVICE" == "all" || "$SERVICE" == "backend" ]]; then
+              echo "- \`${REGISTRY}/backend:${ENV}-${TAG}\`"
+            fi
+            if [[ "$SERVICE" == "all" || "$SERVICE" == "frontend" ]]; then
+              echo "- \`${REGISTRY}/frontend:${ENV}-${TAG}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
