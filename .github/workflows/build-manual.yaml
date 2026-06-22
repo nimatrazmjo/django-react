@@ -86,7 +86,7 @@ jobs:
       # ── 1. Secret scan ───────────────────────────────────────────────────────
       # Must run after checkout — gitleaks walks git history and requires .git.
       - name: Scan for secrets (gitleaks)
-        uses: gitleaks/gitleaks-action@e6dab246340401bf53eec993b8f05aebe80ac636  # v2.3.4
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e  # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
