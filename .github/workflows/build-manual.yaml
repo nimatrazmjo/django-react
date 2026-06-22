@@ -81,7 +81,7 @@ jobs:
       # Runs before checkout so any accidentally committed secret is caught
       # before the repo contents are made available to downstream steps.
       - name: Scan for secrets (gitleaks)
-        uses: gitleaks/gitleaks-action@c8e9b35a6aab5d0dcf13ef8ede0614f4d609cd7a  # v2.3.4
+        uses: gitleaks/gitleaks-action@e6dab246340401bf53eec993b8f05aebe80ac636  # v2.3.4
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -104,7 +104,7 @@ jobs:
 
       # ── 3. Set up Docker Buildx ──────────────────────────────────────────────
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@b5ca514318bd6ebad23c1fb61c09ef34ef1f406d  # v3.10.0
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2  # v3.10.0
         with:
           driver: docker-container
           # docker-container driver is required for:
@@ -147,7 +147,7 @@ jobs:
       # the upstream image or package ships a patch.
       - name: Scan backend image (Trivy)
         if: inputs.push == true && (inputs.service == 'backend' || inputs.service == 'all')
-        uses: aquasecurity/trivy-action@a20de5420d57c4102486cdd9349b532415661010  # v0.26.0
+        uses: aquasecurity/trivy-action@a20de5420d57c4102486cdd9578b45609c99d7eb  # v0.26.0
         with:
           image-ref: ${{ env.ACR_LOGIN_SERVER }}/backend:${{ inputs.environment }}-${{ steps.tag.outputs.value }}
           severity: CRITICAL,HIGH
@@ -156,7 +156,7 @@ jobs:
 
       - name: Scan frontend image (Trivy)
         if: inputs.push == true && (inputs.service == 'frontend' || inputs.service == 'all')
-        uses: aquasecurity/trivy-action@a20de5420d57c4102486cdd9349b532415661010  # v0.26.0
+        uses: aquasecurity/trivy-action@a20de5420d57c4102486cdd9578b45609c99d7eb  # v0.26.0
         with:
           image-ref: ${{ env.ACR_LOGIN_SERVER }}/frontend:${{ inputs.environment }}-${{ steps.tag.outputs.value }}
           severity: CRITICAL,HIGH
