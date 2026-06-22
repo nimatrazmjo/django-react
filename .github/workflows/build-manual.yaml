@@ -149,7 +149,7 @@ jobs:
       # the upstream image or package ships a patch.
       - name: Scan backend image (Trivy)
         if: inputs.push == true && (inputs.service == 'backend' || inputs.service == 'all')
-        uses: aquasecurity/trivy-action@a20de5420d57c4102486cdd9578b45609c99d7eb # v0.26.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ env.ACR_LOGIN_SERVER }}/backend:${{ inputs.environment }}-${{ steps.tag.outputs.value }}
           severity: CRITICAL,HIGH
@@ -158,7 +158,7 @@ jobs:
 
       - name: Scan frontend image (Trivy)
         if: inputs.push == true && (inputs.service == 'frontend' || inputs.service == 'all')
-        uses: aquasecurity/trivy-action@a20de5420d57c4102486cdd9578b45609c99d7eb # v0.26.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ env.ACR_LOGIN_SERVER }}/frontend:${{ inputs.environment }}-${{ steps.tag.outputs.value }}
           severity: CRITICAL,HIGH
