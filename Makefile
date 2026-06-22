@@ -37,9 +37,9 @@ else
   PUSH_FLAG :=
 endif
 
-BAKE_CMD := docker buildx bake $(BAKE_TARGET) $(PUSH_FLAG) \
-              --set "*.platform=linux/amd64" \
-              REGISTRY=$(REGISTRY) TAG=$(TAG)
+BAKE_CMD := REGISTRY=$(REGISTRY) TAG=$(TAG) \
+              docker buildx bake $(BAKE_TARGET) $(PUSH_FLAG) \
+              --set "*.platform=linux/amd64"
 
 # ─────────────────────────────────────────────
 .PHONY: build push print \
@@ -64,7 +64,7 @@ push: build
 
 ## print: dry-run — print resolved bake config without building
 print:
-	docker buildx bake $(BAKE_TARGET) --print REGISTRY=$(REGISTRY) TAG=$(TAG)
+	REGISTRY=$(REGISTRY) TAG=$(TAG) docker buildx bake $(BAKE_TARGET) --print
 
 # ─────────────────────────────────────────────
 # Convenience one-liner targets
