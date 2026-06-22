@@ -7,7 +7,12 @@
       "Bash(git commit -m ' *)",
       "Bash(git -C /Users/nimatullahrazmjo/workstation/dev-ops/django-react diff .github/workflows/build-manual.yaml)",
       "Bash(git -C /Users/nimatullahrazmjo/workstation/dev-ops/django-react add .github/workflows/build-manual.yaml)",
-      "Bash(git -C /Users/nimatullahrazmjo/workstation/dev-ops/django-react commit -m ' *)"
+      "Bash(git -C /Users/nimatullahrazmjo/workstation/dev-ops/django-react commit -m ' *)",
+      "Bash(python -m pytest tests/domain/health/test_entities.py -v)",
+      "Bash(python3 -m pytest --version)",
+      "Bash(pip3 install *)",
+      "Bash(DJANGO_SETTINGS_MODULE=config.settings.dev python3 -m pytest tests/domain/health/test_entities.py -v)",
+      "Bash(python3 -m pytest tests/domain/health/test_entities.py -v)"
     ]
   }
 }
