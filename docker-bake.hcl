@@ -78,8 +78,11 @@ target "frontend-dev" {
 
 target "backend-staging" {
   inherits = ["_backend-base"]
-  target   = "staging"
+  target   = "production"
   tags     = ["${REGISTRY}/backend:staging-${TAG}"]
+  args = {
+    GUNICORN_WORKERS = "2"
+  }
 }
 
 target "frontend-staging" {
@@ -103,6 +106,9 @@ target "backend-prod" {
     "${REGISTRY}/backend:prod-${TAG}",
     "${REGISTRY}/backend:latest",
   ]
+  args = {
+    GUNICORN_WORKERS = "4"
+  }
 }
 
 target "frontend-prod" {

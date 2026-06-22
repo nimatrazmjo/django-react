@@ -5,25 +5,20 @@
 #   staging → staging     (namespace: staging,    image tags: staging-<sha> + staging-latest)
 #   qa      → qa          (namespace: qa,          image tags: qa-<sha> + qa-latest)
 #
-# Why branch-prefixed image tags?
-#   ACR is a shared registry. If QA and staging deploy at the same time and both
-#   push "backend:latest", one overwrites the other. Prefixed tags keep each
-#   environment's images completely separate and independently rollback-able.
-#   The full SHA tag is always unique per commit regardless of branch prefix.
-#
 # Required GitHub secrets (Settings → Secrets and variables → Actions):
-#   AZURE_CLIENT_ID        — Azure AD app client ID for OIDC auth (not a password).
+#   AZURE_CLIENT_ID        — Azure AD app client ID for OIDC auth.
 #   AZURE_TENANT_ID        — Your Azure AD tenant (directory) ID.
 #   AZURE_SUBSCRIPTION_ID  — The Azure subscription containing ACR and AKS.
 #   ACR_NAME               — ACR name without the domain (e.g. "myapp" for myapp.azurecr.io).
 #   AKS_CLUSTER_NAME       — AKS cluster name.
 #   AKS_RESOURCE_GROUP     — Resource group containing the AKS cluster.
 #
-# Why OIDC instead of client secrets?
-#   OIDC issues a short-lived token per workflow run scoped to this repo and branch.
-#   No credential is stored anywhere — nothing to rotate, nothing to leak.
-#   If a bad actor gets access to your repo secrets, they get an ID, not a password.
-#   Setup guide: https://learn.microsoft.com/en-us/azure/developer/github/connect-from-azure
+# Required GitHub variables (Settings → Secrets and variables → Actions → Variables):
+#   VITE_API_URL_PROD      — Public backend URL for the production frontend bundle.
+#   VITE_API_URL_STAGING   — Public backend URL for the staging frontend bundle.
+#   VITE_API_URL_QA        — Public backend URL for the QA frontend bundle.
+#   These are baked into the JS bundle at build time, so they must be real hostnames,
+#   not secrets. Never put a secret in a VITE_* variable — it ends up in the browser.
 
 name: Build and Deploy to AKS
 
@@ -31,39 +26,43 @@ name: Build and Deploy to AKS
 on:
   push:
     branches:
-      - main # → production deploy
-      - staging # → staging deploy
-      - qa # → qa deploy
-    # All other branches (feature/*, fix/*, etc.) do NOT trigger any deploy.
-    # Open a PR against qa to start the promotion chain: qa → staging → main.
+      - main
+      - staging
+      - qa
 
-# ── OIDC permissions ──────────────────────────────────────────────────────────
+# ── Concurrency ────────────────────────────────────────────────────────────────
+# One active deploy per branch at a time. A newer push cancels the in-flight
+# run so a stale build never lands after a fix is already committed.
+# Also prevents simultaneous writes to the same buildcache tag in ACR.
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: true
+
+# ── Permissions ────────────────────────────────────────────────────────────────
+# id-token: write      — request a GitHub OIDC token to exchange for Azure access.
+# contents: read       — check out the repository.
+# security-events: write — upload Trivy SARIF reports to the GitHub Security tab.
 permissions:
-  id-token:
-    write # Lets this workflow request a GitHub OIDC token to exchange
-    # for a short-lived Azure access token. Required by azure/login.
-  contents: read # Lets the workflow check out the repository.
+  id-token: write
+  contents: read
+  security-events: write
 
-# ── Shared environment variables ──────────────────────────────────────────────
+# ── Shared environment variables ───────────────────────────────────────────────
 env:
   ACR_LOGIN_SERVER: ${{ secrets.ACR_NAME }}.azurecr.io
-  # Computed once here; referenced as ${{ env.ACR_LOGIN_SERVER }} in all jobs.
 
+# ══════════════════════════════════════════════════════════════════════════════
+# JOB 1a: Build and push backend image
+#
+# Runs in parallel with build-frontend. Outputs full-tag (prefix+sha) consumed
+# by all deploy jobs to pin the exact commit to each environment.
+# ══════════════════════════════════════════════════════════════════════════════
 jobs:
-  # ═══════════════════════════════════════════════════════════════════════════
-  # JOB 1: Build and push Docker images to ACR
-  #
-  # Runs on every push to main, staging, or qa.
-  # Produces two outputs consumed by the deploy jobs:
-  #   - image-tag: the short git SHA (e.g. "a1b2c3d")
-  #   - tag-prefix: branch-scoped prefix (e.g. "qa-", "staging-", "")
-  # ═══════════════════════════════════════════════════════════════════════════
-  build-and-push:
-    name: Build and Push Images
-    runs-on: ubuntu-latest
+  build-backend:
+    name: Build Backend
+    runs-on: ubuntu-24.04
     outputs:
-      image-tag: ${{ steps.meta.outputs.tag }}
-      tag-prefix: ${{ steps.meta.outputs.prefix }}
+      full-tag: ${{ steps.meta.outputs.full-tag }}
 
     steps:
       - name: Checkout repository
@@ -77,23 +76,21 @@ jobs:
           SHORT_SHA="${SHA:0:7}"
           BRANCH="${{ github.ref_name }}"
 
-          # Prefix image tags by branch so QA/staging/production images never
-          # collide in ACR. Production (main) has no prefix to match convention.
           if [[ "$BRANCH" == "main" ]]; then
             PREFIX=""
           else
-            PREFIX="${BRANCH}-"   # "qa-" or "staging-"
+            PREFIX="${BRANCH}-"
           fi
 
-          echo "tag=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-          echo "prefix=${PREFIX}" >> "$GITHUB_OUTPUT"
-        # Examples of what this produces:
-        #   main    branch, commit abc1234 → tag=abc1234, prefix=""
-        #           images pushed as: backend:abc1234  and backend:latest
-        #   staging branch, commit def5678 → tag=def5678, prefix="staging-"
-        #           images pushed as: backend:staging-def5678 and backend:staging-latest
-        #   qa      branch, commit ghi9012 → tag=ghi9012, prefix="qa-"
-        #           images pushed as: backend:qa-ghi9012 and backend:qa-latest
+          echo "tag=${SHORT_SHA}"             >> "$GITHUB_OUTPUT"
+          echo "prefix=${PREFIX}"             >> "$GITHUB_OUTPUT"
+          echo "full-tag=${PREFIX}${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      # ── Docker Buildx — required for registry-backed layer cache ──────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
 
       # ── Authenticate to Azure via OIDC ───────────────────────────────────────
       - name: Azure login (OIDC)
@@ -102,269 +99,198 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-        # Exchanges the GitHub OIDC JWT for a short-lived Azure access token.
-        # The token is scoped to this repo + branch and expires when the job ends.
-        # No password, no secret, nothing to rotate.
 
       - name: Log in to Azure Container Registry
         run: az acr login --name ${{ secrets.ACR_NAME }}
-        # Uses the Azure token from the step above to authorise Docker push to ACR.
 
-      # ── Build and push backend ────────────────────────────────────────────────
+      # ── Build locally so Trivy can scan before the image reaches ACR ──────────
+      - name: Build backend image (local scan target)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          target: production
+          load: true
+          tags: backend:scan
+          cache-from: type=registry,ref=${{ env.ACR_LOGIN_SERVER }}/backend:buildcache
+
+      # ── Vulnerability scan ────────────────────────────────────────────────────
+      # exit-code is '0' (report-only) until existing base-image CVEs are triaged.
+      # Flip to '1' to block pushes on CRITICAL/HIGH findings once baseline is clear.
+      - name: Scan backend image (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: backend:scan
+          format: sarif
+          output: trivy-backend.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+
+      - name: Upload backend scan results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-backend.sarif
+          category: backend
+
+      # ── Push to ACR with registry cache and supply-chain attestations ─────────
+      # BuildKit reuses the layers already built in the scan step — no rebuild.
       - name: Build and push backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          target: production
+          push: true
+          tags: |
+            ${{ env.ACR_LOGIN_SERVER }}/backend:${{ steps.meta.outputs.full-tag }}
+            ${{ env.ACR_LOGIN_SERVER }}/backend:${{ steps.meta.outputs.prefix }}latest
+          cache-from: type=registry,ref=${{ env.ACR_LOGIN_SERVER }}/backend:buildcache
+          cache-to: type=registry,ref=${{ env.ACR_LOGIN_SERVER }}/backend:buildcache,mode=max
+          provenance: mode=max
+          sbom: true
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # JOB 1b: Build and push frontend image
+  #
+  # Runs in parallel with build-backend. Computes VITE_* build args from
+  # GitHub Actions variables — never hardcoded, never a secret.
+  # ══════════════════════════════════════════════════════════════════════════════
+  build-frontend:
+    name: Build Frontend
+    runs-on: ubuntu-24.04
+    outputs:
+      full-tag: ${{ steps.meta.outputs.full-tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Compute branch-scoped tag and Vite build args ─────────────────────────
+      - name: Compute image tags and Vite vars
+        id: meta
         run: |
-          IMAGE="${{ env.ACR_LOGIN_SERVER }}/backend"
-          PREFIX="${{ steps.meta.outputs.prefix }}"
-          TAG="${{ steps.meta.outputs.tag }}"
-
-          # VITE_* are frontend-only; backend has no build args that vary by branch.
-          docker build \
-            --target production \
-            --tag "${IMAGE}:${PREFIX}${TAG}" \
-            --tag "${IMAGE}:${PREFIX}latest" \
-            ./backend
-          # --target production: gunicorn stage, non-root user (see backend/Dockerfile).
-          # SHA tag: lets you trace exactly which commit is running in any environment.
-          #          Roll back by setting this tag in the deployment — no rebuild needed.
-          # prefix-latest tag: used for human reference ("what's the latest QA build?").
-
-          docker push "${IMAGE}:${PREFIX}${TAG}"
-          docker push "${IMAGE}:${PREFIX}latest"
-
-      # ── Build and push frontend ───────────────────────────────────────────────
-      - name: Build and push frontend image
-        run: |
-          IMAGE="${{ env.ACR_LOGIN_SERVER }}/frontend"
-          PREFIX="${{ steps.meta.outputs.prefix }}"
-          TAG="${{ steps.meta.outputs.tag }}"
+          SHA="${{ github.sha }}"
+          SHORT_SHA="${SHA:0:7}"
           BRANCH="${{ github.ref_name }}"
 
-          # VITE_API_URL is baked into the JS bundle at build time (not a runtime var).
-          # It must match the public hostname of the API for each environment.
-          # Update these URLs to match your actual domain names.
           if [[ "$BRANCH" == "main" ]]; then
-            VITE_API_URL="https://127.0.0.1.nip.io"
+            PREFIX=""
+            VITE_API_URL="${{ vars.VITE_API_URL_PROD }}"
             VITE_ENV="production"
           elif [[ "$BRANCH" == "staging" ]]; then
-            VITE_API_URL="https://staging.127.0.0.1.nip.io"
+            PREFIX="staging-"
+            VITE_API_URL="${{ vars.VITE_API_URL_STAGING }}"
             VITE_ENV="staging"
           else
-            VITE_API_URL="https://qa.127.0.0.1.nip.io"
+            PREFIX="qa-"
+            VITE_API_URL="${{ vars.VITE_API_URL_QA }}"
             VITE_ENV="qa"
           fi
 
-          docker build \
-            --target production \
-            --build-arg VITE_API_URL="${VITE_API_URL}" \
-            --build-arg VITE_ENV="${VITE_ENV}" \
-            --tag "${IMAGE}:${PREFIX}${TAG}" \
-            --tag "${IMAGE}:${PREFIX}latest" \
-            ./frontend
+          echo "tag=${SHORT_SHA}"             >> "$GITHUB_OUTPUT"
+          echo "prefix=${PREFIX}"             >> "$GITHUB_OUTPUT"
+          echo "full-tag=${PREFIX}${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "vite-api-url=${VITE_API_URL}" >> "$GITHUB_OUTPUT"
+          echo "vite-env=${VITE_ENV}"         >> "$GITHUB_OUTPUT"
 
-          docker push "${IMAGE}:${PREFIX}${TAG}"
-          docker push "${IMAGE}:${PREFIX}latest"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
 
-  # ═══════════════════════════════════════════════════════════════════════════
-  # JOB 2a: Deploy to QA
-  # Runs only on push to the qa branch.
-  # ═══════════════════════════════════════════════════════════════════════════
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to Azure Container Registry
+        run: az acr login --name ${{ secrets.ACR_NAME }}
+
+      # ── Build locally for scan ────────────────────────────────────────────────
+      - name: Build frontend image (local scan target)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: frontend/Dockerfile
+          target: production
+          load: true
+          tags: frontend:scan
+          build-args: |
+            VITE_API_URL=${{ steps.meta.outputs.vite-api-url }}
+            VITE_ENV=${{ steps.meta.outputs.vite-env }}
+          cache-from: type=registry,ref=${{ env.ACR_LOGIN_SERVER }}/frontend:buildcache
+
+      - name: Scan frontend image (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: frontend:scan
+          format: sarif
+          output: trivy-frontend.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+
+      - name: Upload frontend scan results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-frontend.sarif
+          category: frontend
+
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: frontend/Dockerfile
+          target: production
+          push: true
+          build-args: |
+            VITE_API_URL=${{ steps.meta.outputs.vite-api-url }}
+            VITE_ENV=${{ steps.meta.outputs.vite-env }}
+          tags: |
+            ${{ env.ACR_LOGIN_SERVER }}/frontend:${{ steps.meta.outputs.full-tag }}
+            ${{ env.ACR_LOGIN_SERVER }}/frontend:${{ steps.meta.outputs.prefix }}latest
+          cache-from: type=registry,ref=${{ env.ACR_LOGIN_SERVER }}/frontend:buildcache
+          cache-to: type=registry,ref=${{ env.ACR_LOGIN_SERVER }}/frontend:buildcache,mode=max
+          provenance: mode=max
+          sbom: true
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # JOB 2a/2b/2c: Deploy to QA / Staging / Production
+  #
+  # Each calls the reusable _deploy-env.yaml workflow with environment-specific
+  # inputs. Only one runs per trigger (the if: condition is mutually exclusive).
+  # All three need both build jobs — a failed scan blocks every deploy.
+  # ══════════════════════════════════════════════════════════════════════════════
   deploy-qa:
     name: Deploy to QA
-    runs-on: ubuntu-latest
-    needs: build-and-push
+    needs: [build-backend, build-frontend]
     if: github.ref_name == 'qa'
-    # if: ensures this job is silently skipped on main and staging pushes.
-    # It does not fail the workflow — the other deploy job simply runs instead.
+    uses: ./.github/workflows/_deploy-env.yaml
+    with:
+      environment: qa
+      namespace: qa
+      full-tag: ${{ needs.build-backend.outputs.full-tag }}
+    secrets: inherit
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        # Needed to access the k8s/overlays/qa/ directory.
-
-      - name: Azure login (OIDC)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-        # Each job gets a fresh OIDC token — tokens from other jobs cannot be reused.
-
-      - name: Set AKS context
-        run: |
-          az aks get-credentials \
-            --resource-group ${{ secrets.AKS_RESOURCE_GROUP }} \
-            --name ${{ secrets.AKS_CLUSTER_NAME }} \
-            --overwrite-existing
-
-      # ── Apply QA overlay ──────────────────────────────────────────────────────
-      - name: Apply QA manifests (Kustomize)
-        run: kubectl apply -k k8s/overlays/qa
-        # kubectl apply -k uses Kustomize to render the overlay and apply the result.
-        # This is equivalent to: kubectl kustomize k8s/overlays/qa | kubectl apply -f -
-        # The QA overlay sets namespace: qa, 1 replica, and smaller resource sizes.
-        # kubectl apply is idempotent — safe to re-run; it creates or updates as needed.
-
-      # ── Pin the exact image tag that was just built ───────────────────────────
-      - name: Pin backend image tag in QA
-        run: |
-          TAG="${{ needs.build-and-push.outputs.tag-prefix }}${{ needs.build-and-push.outputs.image-tag }}"
-          kubectl set image deployment/backend backend=${{ env.ACR_LOGIN_SERVER }}/backend:${TAG} -n qa
-        # kubectl apply -k sets the image to whatever is in the base deployment.yaml (:latest).
-        # This step overwrites it with the exact SHA tag built in this run.
-        # Without this, a pod restart could pull a different "latest" than what CI tested.
-        # With this, every pod in QA runs precisely the commit that triggered this workflow.
-
-      - name: Pin frontend image tag in QA
-        run: |
-          TAG="${{ needs.build-and-push.outputs.tag-prefix }}${{ needs.build-and-push.outputs.image-tag }}"
-          kubectl set image deployment/frontend frontend=${{ env.ACR_LOGIN_SERVER }}/frontend:${TAG} -n qa
-
-      # ── Wait for rollouts — pipeline fails here if pods crash ─────────────────
-      - name: Wait for backend rollout in QA
-        run: kubectl rollout status deployment/backend -n qa --timeout=5m
-        # rollout status blocks until all pods are running the new image AND passing
-        # their readiness probe (/api/health/ for the backend).
-        # If pods crash on startup (bad migration, OOMKilled, wrong config),
-        # rollout status exits non-zero and THIS STEP FAILS — the pipeline stops,
-        # GitHub marks the run as failed, and notifications fire immediately.
-        # A broken QA deploy will never silently pass as green.
-        # --timeout=5m: if no progress in 5 minutes, give up and fail the pipeline.
-        # Increase if your migrations are known to take longer.
-
-      - name: Wait for frontend rollout in QA
-        run: kubectl rollout status deployment/frontend -n qa --timeout=3m
-        # nginx starts in ~1 second. 3-minute timeout is very conservative.
-        # Failure here usually means: image pull error, resource quota exceeded,
-        # or node has insufficient capacity.
-
-      - name: Show QA pod status
-        if: always() # Run even if a previous step failed — useful for debugging.
-        run: kubectl get pods -n qa
-        # Final visual confirmation. All pods should show Running / Ready (1/1 or 2/2).
-
-  # ═══════════════════════════════════════════════════════════════════════════
-  # JOB 2b: Deploy to Staging
-  # Runs only on push to the staging branch.
-  # ═══════════════════════════════════════════════════════════════════════════
   deploy-staging:
     name: Deploy to Staging
-    runs-on: ubuntu-latest
-    needs: build-and-push
+    needs: [build-backend, build-frontend]
     if: github.ref_name == 'staging'
+    uses: ./.github/workflows/_deploy-env.yaml
+    with:
+      environment: staging
+      namespace: staging
+      full-tag: ${{ needs.build-backend.outputs.full-tag }}
+    secrets: inherit
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Azure login (OIDC)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Set AKS context
-        run: |
-          az aks get-credentials \
-            --resource-group ${{ secrets.AKS_RESOURCE_GROUP }} \
-            --name ${{ secrets.AKS_CLUSTER_NAME }} \
-            --overwrite-existing
-
-      # ── Apply staging overlay ─────────────────────────────────────────────────
-      - name: Apply staging manifests (Kustomize)
-        run: kubectl apply -k k8s/overlays/staging
-        # Staging overlay: namespace: staging, 2 replicas, medium resource sizes.
-        # Running 2 replicas means rolling updates are tested — same as production.
-        # If a rolling update fails in staging, it will fail in production too.
-        # Find it here, not there.
-
-      - name: Pin backend image tag in staging
-        run: |
-          TAG="${{ needs.build-and-push.outputs.tag-prefix }}${{ needs.build-and-push.outputs.image-tag }}"
-          kubectl set image deployment/backend backend=${{ env.ACR_LOGIN_SERVER }}/backend:${TAG} -n staging
-
-      - name: Pin frontend image tag in staging
-        run: |
-          TAG="${{ needs.build-and-push.outputs.tag-prefix }}${{ needs.build-and-push.outputs.image-tag }}"
-          kubectl set image deployment/frontend frontend=${{ env.ACR_LOGIN_SERVER }}/frontend:${TAG} -n staging
-
-      # ── Wait for rollouts — pipeline fails here if pods crash ─────────────────
-      - name: Wait for backend rollout in staging
-        run: kubectl rollout status deployment/backend -n staging --timeout=5m
-        # Same guarantee as QA: if the deploy is broken, this step fails,
-        # the pipeline fails, and you are notified before it reaches production.
-        # Staging is the last gate before main — treat failures here seriously.
-
-      - name: Wait for frontend rollout in staging
-        run: kubectl rollout status deployment/frontend -n staging --timeout=3m
-
-      - name: Show staging pod status
-        if: always()
-        run: kubectl get pods -n staging
-
-  # ═══════════════════════════════════════════════════════════════════════════
-  # JOB 2c: Deploy to Production
-  # Runs only on push to main.
-  # ═══════════════════════════════════════════════════════════════════════════
   deploy-production:
     name: Deploy to Production
-    runs-on: ubuntu-latest
-    needs: build-and-push
+    needs: [build-backend, build-frontend]
     if: github.ref_name == 'main'
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Azure login (OIDC)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Set AKS context
-        run: |
-          az aks get-credentials \
-            --resource-group ${{ secrets.AKS_RESOURCE_GROUP }} \
-            --name ${{ secrets.AKS_CLUSTER_NAME }} \
-            --overwrite-existing
-
-      # ── Apply production overlay ──────────────────────────────────────────────
-      - name: Apply production manifests (Kustomize)
-        run: kubectl apply -k k8s/overlays/production
-        # Production overlay: namespace: production, 2 replicas, full resource sizes.
-        # kubectl apply is idempotent — existing resources are updated in-place.
-        # New resources (first deploy) are created. Nothing is deleted by apply alone.
-
-      - name: Pin backend image tag in production
-        run: |
-          TAG="${{ needs.build-and-push.outputs.tag-prefix }}${{ needs.build-and-push.outputs.image-tag }}"
-          kubectl set image deployment/backend backend=${{ env.ACR_LOGIN_SERVER }}/backend:${TAG} -n production
-        # TAG for production has no prefix (prefix is ""), so this resolves to just the SHA:
-        # e.g. backend:a1b2c3d — the exact commit that passed QA and staging before reaching here.
-
-      - name: Pin frontend image tag in production
-        run: |
-          TAG="${{ needs.build-and-push.outputs.tag-prefix }}${{ needs.build-and-push.outputs.image-tag }}"
-          kubectl set image deployment/frontend frontend=${{ env.ACR_LOGIN_SERVER }}/frontend:${TAG} -n production
-
-      # ── Wait for rollouts — pipeline fails here if pods crash ─────────────────
-      - name: Wait for backend rollout in production
-        run: kubectl rollout status deployment/backend -n production --timeout=5m
-        # This is the production safety gate.
-        # If a pod fails its readiness probe (/api/health/) during rollout:
-        #   - Kubernetes pauses the rolling update
-        #   - The old pods keep serving traffic (zero downtime preserved)
-        #   - rollout status exits non-zero after --timeout
-        #   - This step fails → the pipeline fails → you are immediately notified
-        # The deploy is NOT automatically rolled back — Kubernetes holds the
-        # partial rollout until you manually run: kubectl rollout undo deployment/backend -n production
-        # This prevents automated rollbacks from masking the root cause.
-
-      - name: Wait for frontend rollout in production
-        run: kubectl rollout status deployment/frontend -n production --timeout=3m
-
-      - name: Show production pod status
-        if: always()
-        run: kubectl get pods -n production
+    uses: ./.github/workflows/_deploy-env.yaml
+    with:
+      environment: production
+      namespace: production
+      full-tag: ${{ needs.build-backend.outputs.full-tag }}
+    secrets: inherit

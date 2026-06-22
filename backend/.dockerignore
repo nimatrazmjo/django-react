@@ -1,0 +1,12 @@
+# backend/.dockerignore — used when context is ./backend
+__pycache__
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.pytest_cache
+htmlcov
+.coverage
+.env
+.env.*
+!.env.example
+.DS_Store

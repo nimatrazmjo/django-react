@@ -1,0 +1,103 @@
+# .github/workflows/_deploy-env.yaml — Reusable deploy workflow.
+#
+# Called by deploy.yaml for each environment (qa / staging / production).
+# All three deploy jobs were previously identical except for namespace and
+# overlay path; this single workflow eliminates that duplication.
+#
+# Inputs:
+#   environment  — human label used in log output (qa / staging / production)
+#   namespace    — Kubernetes namespace to deploy into
+#   full-tag     — fully-qualified image tag (e.g. "qa-abc1234" or "abc1234" for prod)
+#
+# Secrets: inherited from the caller — no enumeration required.
+#   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID,
+#   ACR_NAME, AKS_CLUSTER_NAME, AKS_RESOURCE_GROUP
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Target environment label (qa / staging / production)"
+        required: true
+        type: string
+      namespace:
+        description: "Kubernetes namespace"
+        required: true
+        type: string
+      full-tag:
+        description: "Full image tag including branch prefix (e.g. qa-abc1234)"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Authenticate to Azure via OIDC ────────────────────────────────────────
+      # Each job requires its own OIDC token — tokens do not cross job boundaries.
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set AKS context
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ secrets.AKS_RESOURCE_GROUP }} \
+            --name ${{ secrets.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
+
+      # ── Apply Kustomize overlay ───────────────────────────────────────────────
+      # kubectl apply is idempotent — creates or updates as needed.
+      - name: Apply ${{ inputs.environment }} manifests (Kustomize)
+        run: kubectl apply -k k8s/overlays/${{ inputs.environment }}
+
+      # ── Pin the exact image tag that was just built ───────────────────────────
+      # Without this, a pod restart after this job could pull a different
+      # "latest" than what CI built. The SHA tag locks every pod to this commit.
+      - name: Pin backend image tag
+        run: |
+          ACR="${{ secrets.ACR_NAME }}.azurecr.io"
+          TAG="${{ inputs.full-tag }}"
+          kubectl set image deployment/backend \
+            backend=${ACR}/backend:${TAG} \
+            -n ${{ inputs.namespace }}
+
+      - name: Pin frontend image tag
+        run: |
+          ACR="${{ secrets.ACR_NAME }}.azurecr.io"
+          TAG="${{ inputs.full-tag }}"
+          kubectl set image deployment/frontend \
+            frontend=${ACR}/frontend:${TAG} \
+            -n ${{ inputs.namespace }}
+
+      # ── Wait for rollouts ─────────────────────────────────────────────────────
+      # rollout status blocks until all pods pass their readiness probe.
+      # If pods crash or fail their probe, this step exits non-zero and the
+      # pipeline fails — a broken deploy never silently passes as green.
+      - name: Wait for backend rollout
+        run: |
+          kubectl rollout status deployment/backend \
+            -n ${{ inputs.namespace }} --timeout=5m
+
+      - name: Wait for frontend rollout
+        run: |
+          kubectl rollout status deployment/frontend \
+            -n ${{ inputs.namespace }} --timeout=3m
+
+      # ── Final status dump — runs even on failure for debugging ─────────────────
+      - name: Show pod status
+        if: always()
+        run: kubectl get pods -n ${{ inputs.namespace }}

@@ -18,12 +18,11 @@ name: "Manual: Build Docker Images"
 on:
   workflow_dispatch:
     inputs:
-
       environment:
         description: "Target environment"
         required: true
         type: choice
-        default: staging
+        default: dev
         options:
           - dev
           - staging
@@ -33,7 +32,7 @@ on:
         description: "Service to build (all = backend + frontend)"
         required: true
         type: choice
-        default: all
+        default: backend
         options:
           - all
           - backend
@@ -65,7 +64,7 @@ env:
 jobs:
   build:
     name: "Build [${{ inputs.service }}] → [${{ inputs.environment }}]"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       # ── 1. Checkout ──────────────────────────────────────────────────────────

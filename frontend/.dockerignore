@@ -1,0 +1,8 @@
+# frontend/.dockerignore — used when context is ./frontend
+node_modules
+dist
+.vite
+.env
+.env.*
+!.env.example
+.DS_Store

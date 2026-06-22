@@ -1,0 +1,36 @@
+# Root .dockerignore — prevents large or sensitive paths from being sent as
+# Docker build context. Without this, node_modules (often 500 MB+), .git, and
+# dist land in the context tarball on every build, inflating "sending context" time.
+
+# Version control
+.git
+.gitignore
+
+# Frontend build artifacts and dependencies
+frontend/node_modules
+frontend/dist
+frontend/.vite
+
+# Backend Python artifacts
+backend/__pycache__
+backend/**/__pycache__
+backend/**/*.pyc
+backend/**/*.pyo
+backend/.pytest_cache
+backend/htmlcov
+backend/.coverage
+
+# Environment files — never send secrets to the build daemon
+.env
+.env.*
+!.env.example
+
+# Local dev / editor artifacts
+.DS_Store
+*.swp
+*.swo
+.idea
+.vscode
+
+# CI artifacts
+.github
