@@ -41,12 +41,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       # ── Authenticate to Azure via OIDC ────────────────────────────────────────
       # Each job requires its own OIDC token — tokens do not cross job boundaries.
       - name: Azure login (OIDC)
-        uses: azure/login@v2
+        uses: azure/login@a65d910e8af852a8061c627c456678983e180302  # v2.3.0
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -59,29 +59,26 @@ jobs:
             --name ${{ secrets.AKS_CLUSTER_NAME }} \
             --overwrite-existing
 
+      # ── Pin the exact image tag in the Kustomize overlay ─────────────────────
+      # Modifies the overlay file locally (not committed to git) so the
+      # subsequent kubectl apply picks up the SHA tag built for this run.
+      # This avoids `kubectl set image` which mutates live cluster state without
+      # updating the overlay — causing drift on the next `kubectl apply -k`.
+      - name: Pin image tags in Kustomize overlay
+        run: |
+          ACR="${{ secrets.ACR_NAME }}.azurecr.io"
+          TAG="${{ inputs.full-tag }}"
+          cd k8s/overlays/${{ inputs.environment }}
+          kustomize edit set image \
+            "<ACR_NAME>.azurecr.io/backend=${ACR}/backend:${TAG}"
+          kustomize edit set image \
+            "<ACR_NAME>.azurecr.io/frontend=${ACR}/frontend:${TAG}"
+
       # ── Apply Kustomize overlay ───────────────────────────────────────────────
       # kubectl apply is idempotent — creates or updates as needed.
+      # The overlay was patched in the previous step with the exact image tag.
       - name: Apply ${{ inputs.environment }} manifests (Kustomize)
         run: kubectl apply -k k8s/overlays/${{ inputs.environment }}
-
-      # ── Pin the exact image tag that was just built ───────────────────────────
-      # Without this, a pod restart after this job could pull a different
-      # "latest" than what CI built. The SHA tag locks every pod to this commit.
-      - name: Pin backend image tag
-        run: |
-          ACR="${{ secrets.ACR_NAME }}.azurecr.io"
-          TAG="${{ inputs.full-tag }}"
-          kubectl set image deployment/backend \
-            backend=${ACR}/backend:${TAG} \
-            -n ${{ inputs.namespace }}
-
-      - name: Pin frontend image tag
-        run: |
-          ACR="${{ secrets.ACR_NAME }}.azurecr.io"
-          TAG="${{ inputs.full-tag }}"
-          kubectl set image deployment/frontend \
-            frontend=${ACR}/frontend:${TAG} \
-            -n ${{ inputs.namespace }}
 
       # ── Wait for rollouts ─────────────────────────────────────────────────────
       # rollout status blocks until all pods pass their readiness probe.

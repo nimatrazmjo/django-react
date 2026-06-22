@@ -38,8 +38,7 @@ else
 endif
 
 BAKE_CMD := REGISTRY=$(REGISTRY) TAG=$(TAG) \
-              docker buildx bake $(BAKE_TARGET) $(PUSH_FLAG) \
-              --set "*.platform=linux/amd64"
+              docker buildx bake $(BAKE_TARGET) $(PUSH_FLAG)
 
 # ─────────────────────────────────────────────
 .PHONY: build push print \

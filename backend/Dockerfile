@@ -1,37 +1,31 @@
 # backend/Dockerfile
 
 # ================================
-# Stage 1: Base
+# Stage 1: Builder — installs deps into a venv
+#
+# All current dependencies (psycopg[binary], Django, DRF, redis) ship as
+# binary wheels or pure Python — no system build tools are needed.
+# If a future package requires compilation, add build-essential here only;
+# the production stage will remain clean because it copies the venv, not
+# the build environment.
 # ================================
-FROM python:3.12-slim AS base
+FROM python:3.12-slim AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# apt-get upgrade applies security patches from Debian's repos that aren't
-# baked into the upstream python:slim image yet, clearing most OS-level CVEs.
-RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
-    build-essential \
-    libpq-dev \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# ================================
-# Stage 2: Dependencies
-# ================================
-FROM base AS dependencies
+RUN python -m venv /app/venv
+ENV PATH="/app/venv/bin:$PATH"
 
 COPY requirements*.txt ./
-# --no-cache-dir: skip writing the pip cache — it's discarded when the layer
-# is committed anyway, so caching it just wastes image space and build time.
 RUN pip install --no-cache-dir -r requirements.txt
 
 # ================================
-# Stage 3: Development
+# Stage 2: Development
 # ================================
-FROM dependencies AS development
+FROM builder AS development
 
 RUN pip install --no-cache-dir -r requirements-dev.txt
 
@@ -45,17 +39,33 @@ ENTRYPOINT ["/entrypoint.sh"]
 CMD ["python", "manage.py", "runserver", "0.0.0.0:8000"]
 
 # ================================
-# Stage 4: Production / Staging
+# Stage 3: Production / Staging
 #
-# Staging and production are the same binary — environment differences are
-# handled at runtime via env vars and Kubernetes config. The only build-time
-# difference is worker count: staging runs 2 workers to mirror rolling-update
-# behaviour; production runs 4. Pass GUNICORN_WORKERS as a build arg.
+# Starts from a clean python:3.12-slim — no compiler toolchain, no libpq-dev.
+# The venv is copied from the builder stage; psycopg[binary] bundles libpq so
+# no extra system libraries are required at runtime.
+#
+# Staging and production are the same binary; env differences are handled at
+# runtime via env vars and Kubernetes config. The only build-time difference is
+# worker count: staging=2, production=4 (passed as GUNICORN_WORKERS build arg).
 # ================================
-FROM dependencies AS production
+FROM python:3.12-slim AS production
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/app/venv/bin:$PATH" \
+    VIRTUAL_ENV=/app/venv
+
+WORKDIR /app
+
+# curl: used by entrypoint.sh for DB readiness probes
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
 ARG GUNICORN_WORKERS=4
 
+COPY --from=builder /app/venv /app/venv
 COPY . .
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

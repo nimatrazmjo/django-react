@@ -53,9 +53,13 @@ on:
 # ── Permissions ────────────────────────────────────────────────────────────────
 # id-token: write  — needed to exchange a GitHub OIDC token for an Azure token.
 # contents: read   — needed to check out the repo.
+# packages: read   — needed by gitleaks-action to read workflow metadata.
+# actions: read    — needed by trivy-action to upload SARIF results.
 permissions:
   id-token: write
   contents: read
+  packages: read
+  actions: read
 
 # ── Shared env ─────────────────────────────────────────────────────────────────
 env:
@@ -66,10 +70,26 @@ jobs:
     name: "Build [${{ inputs.service }}] → [${{ inputs.environment }}]"
     runs-on: ubuntu-24.04
 
+    # cache: write allows docker-bake to populate the GHA layer cache
+    permissions:
+      id-token: write
+      contents: read
+      packages: read
+      actions: read
+      cache: write
+
     steps:
+      # ── 0. Secret scan ───────────────────────────────────────────────────────
+      # Runs before checkout so any accidentally committed secret is caught
+      # before the repo contents are made available to downstream steps.
+      - name: Scan for secrets (gitleaks)
+        uses: gitleaks/gitleaks-action@c8e9b35a6aab5d0dcf13ef8ede0614f4d609cd7a  # v2.3.4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       # ── 1. Checkout ──────────────────────────────────────────────────────────
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       # ── 2. Resolve image tag ─────────────────────────────────────────────────
       - name: Resolve image tag
@@ -86,7 +106,7 @@ jobs:
 
       # ── 3. Set up Docker Buildx ──────────────────────────────────────────────
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@b5ca514318bd6ebad23c1fb61c09ef34ef1f406d  # v3.10.0
         with:
           driver: docker-container
           # docker-container driver is required for:
@@ -97,7 +117,7 @@ jobs:
 
       # ── 4. Azure OIDC login ──────────────────────────────────────────────────
       - name: Azure login (OIDC)
-        uses: azure/login@v2
+        uses: azure/login@a65d910e8af852a8061c627c456678983e180302  # v2.3.0
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -123,7 +143,29 @@ jobs:
         # passes REGISTRY, TAG, and --push through to docker buildx bake.
         # All build matrix logic lives in docker-bake.hcl — this step stays thin.
 
-      # ── 6. Summary ──────────────────────────────────────────────────────────
+      # ── 6. Vulnerability scan — backend ─────────────────────────────────────
+      # Only scan when pushing; local-only builds are not destined for a registry.
+      # ignore-unfixed: skip CVEs with no available fix — these are noise until
+      # the upstream image or package ships a patch.
+      - name: Scan backend image (Trivy)
+        if: inputs.push == true && (inputs.service == 'backend' || inputs.service == 'all')
+        uses: aquasecurity/trivy-action@a20de5420d57c4102486cdd9349b532415661010  # v0.26.0
+        with:
+          image-ref: ${{ env.ACR_LOGIN_SERVER }}/backend:${{ inputs.environment }}-${{ steps.tag.outputs.value }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Scan frontend image (Trivy)
+        if: inputs.push == true && (inputs.service == 'frontend' || inputs.service == 'all')
+        uses: aquasecurity/trivy-action@a20de5420d57c4102486cdd9349b532415661010  # v0.26.0
+        with:
+          image-ref: ${{ env.ACR_LOGIN_SERVER }}/frontend:${{ inputs.environment }}-${{ steps.tag.outputs.value }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+      # ── 7. Summary ──────────────────────────────────────────────────────────
       - name: Write job summary
         if: always()
         run: |

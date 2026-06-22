@@ -41,16 +41,33 @@ target "_backend-base" {
   context    = "./backend"
   dockerfile = "Dockerfile"
   platforms  = ["linux/amd64"]
-  cache-from = ["type=registry,ref=${REGISTRY}/backend:buildcache"]
-  cache-to   = ["type=registry,ref=${REGISTRY}/backend:buildcache,mode=max"]
+  # pull=true: always check for a fresher base image digest on each build.
+  # Replaces the removed `apt-get upgrade` as the mechanism for picking up
+  # upstream OS/runtime patches without busting the dependency layer cache.
+  pull = true
+  cache-from = [
+    "type=registry,ref=${REGISTRY}/backend:buildcache",
+    "type=gha,scope=backend",
+  ]
+  cache-to = [
+    "type=registry,ref=${REGISTRY}/backend:buildcache,mode=min",
+    "type=gha,scope=backend,mode=min",
+  ]
 }
 
 target "_frontend-base" {
   context    = "."
   dockerfile = "frontend/Dockerfile"
   platforms  = ["linux/amd64"]
-  cache-from = ["type=registry,ref=${REGISTRY}/frontend:buildcache"]
-  cache-to   = ["type=registry,ref=${REGISTRY}/frontend:buildcache,mode=max"]
+  pull = true
+  cache-from = [
+    "type=registry,ref=${REGISTRY}/frontend:buildcache",
+    "type=gha,scope=frontend",
+  ]
+  cache-to = [
+    "type=registry,ref=${REGISTRY}/frontend:buildcache,mode=min",
+    "type=gha,scope=frontend,mode=min",
+  ]
 }
 
 # ─────────────────────────────────────────────
@@ -104,7 +121,6 @@ target "backend-prod" {
   target   = "production"
   tags = [
     "${REGISTRY}/backend:prod-${TAG}",
-    "${REGISTRY}/backend:latest",
   ]
   args = {
     GUNICORN_WORKERS = "4"
@@ -116,7 +132,6 @@ target "frontend-prod" {
   target   = "production"
   tags = [
     "${REGISTRY}/frontend:prod-${TAG}",
-    "${REGISTRY}/frontend:latest",
   ]
   args = {
     VITE_API_URL = VITE_API_URL_PROD
