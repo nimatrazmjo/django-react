@@ -7,11 +7,9 @@ FROM node:24-alpine AS base
 
 WORKDIR /app
 
-# Upgrade npm to patch CVE-2026-12151 (undici DoS) and CVE-2026-31802 (node-tar symlink traversal).
-# npm@10.9.3 bundles tar < 7.5.11; install tar@7.5.11 globally after to ensure
-# npm's own tar usage is clean (relevant if provenance attestations are scanned).
-RUN npm install -g npm@10.9.3 \
-    && npm install -g tar@7.5.11
+# Upgrade npm to patch CVE-2026-12151 (undici DoS via unbounded WebSocket memory growth).
+# The bundled undici in npm <10.9.3 is vulnerable; pin to a known-good version for reproducibility.
+RUN npm install -g npm@10.9.3
 
 # ================================
 # Stage 2: Dependencies

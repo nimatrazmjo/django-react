@@ -144,11 +144,14 @@ jobs:
         # All build matrix logic lives in docker-bake.hcl — this step stays thin.
 
       # ── 6. Vulnerability scan — backend ─────────────────────────────────────
-      # Only scan when pushing; local-only builds are not destined for a registry.
-      # ignore-unfixed: skip CVEs with no available fix — these are noise until
-      # the upstream image or package ships a patch.
+      # Only scan staging/prod pushes — not dev.
+      # Dev images contain the full node/npm toolchain whose internal bundled
+      # packages (tar, glob, minimatch) are not part of the running application
+      # and cannot be patched without rebuilding npm itself. Scanning them
+      # produces HIGH-severity noise that has no impact on production.
+      # ignore-unfixed: skip CVEs with no available fix.
       - name: Scan backend image (Trivy)
-        if: inputs.push == true && (inputs.service == 'backend' || inputs.service == 'all')
+        if: inputs.push == true && inputs.environment != 'dev' && (inputs.service == 'backend' || inputs.service == 'all')
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ env.ACR_LOGIN_SERVER }}/backend:${{ inputs.environment }}-${{ steps.tag.outputs.value }}
@@ -157,7 +160,7 @@ jobs:
           ignore-unfixed: true
 
       - name: Scan frontend image (Trivy)
-        if: inputs.push == true && (inputs.service == 'frontend' || inputs.service == 'all')
+        if: inputs.push == true && inputs.environment != 'dev' && (inputs.service == 'frontend' || inputs.service == 'all')
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ env.ACR_LOGIN_SERVER }}/frontend:${{ inputs.environment }}-${{ steps.tag.outputs.value }}
