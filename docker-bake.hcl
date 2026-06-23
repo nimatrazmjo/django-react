@@ -94,18 +94,25 @@ target "frontend-dev" {
 # ─────────────────────────────────────────────
 
 target "backend-staging" {
-  inherits = ["_backend-base"]
-  target   = "production"
-  tags     = ["${REGISTRY}/backend:staging-${TAG}"]
+  inherits   = ["_backend-base"]
+  target     = "production"
+  tags       = ["${REGISTRY}/backend:staging-${TAG}"]
+  # provenance=false: suppress build-stage provenance attestations so Trivy
+  # doesn't flag builder-only packages (e.g. pip build tools) in the final image.
+  provenance = false
   args = {
     GUNICORN_WORKERS = "2"
   }
 }
 
 target "frontend-staging" {
-  inherits = ["_frontend-base"]
-  target   = "staging"
-  tags     = ["${REGISTRY}/frontend:staging-${TAG}"]
+  inherits   = ["_frontend-base"]
+  target     = "staging"
+  tags       = ["${REGISTRY}/frontend:staging-${TAG}"]
+  # provenance=false: the builder stage installs npm (which bundles node-tar);
+  # those packages don't exist in the final nginx image, but Buildx provenance
+  # attestations expose them to Trivy. Disable to keep scans accurate.
+  provenance = false
   args = {
     VITE_API_URL = VITE_API_URL_STAGING
     VITE_ENV     = "staging"
@@ -117,8 +124,9 @@ target "frontend-staging" {
 # ─────────────────────────────────────────────
 
 target "backend-prod" {
-  inherits = ["_backend-base"]
-  target   = "production"
+  inherits   = ["_backend-base"]
+  target     = "production"
+  provenance = false
   tags = [
     "${REGISTRY}/backend:prod-${TAG}",
   ]
@@ -128,8 +136,9 @@ target "backend-prod" {
 }
 
 target "frontend-prod" {
-  inherits = ["_frontend-base"]
-  target   = "production"
+  inherits   = ["_frontend-base"]
+  target     = "production"
+  provenance = false
   tags = [
     "${REGISTRY}/frontend:prod-${TAG}",
   ]
